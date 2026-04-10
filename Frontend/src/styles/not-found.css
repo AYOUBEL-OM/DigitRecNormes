@@ -1,0 +1,92 @@
+.legacy-test-not-found {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background:
+    radial-gradient(circle at top left, rgba(37, 99, 235, 0.18), transparent 26%),
+    linear-gradient(135deg, #f4f8fc 0%, #eef2f7 48%, #ffffff 100%);
+}
+
+.legacy-test-not-found__card {
+  width: min(680px, 100%);
+  padding: 44px 36px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 30px;
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow: 0 28px 80px rgba(15, 23, 42, 0.12);
+  text-align: center;
+}
+
+.legacy-test-not-found__eyebrow {
+  color: #64748b;
+  font-size: 0.74rem;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+}
+
+.legacy-test-not-found__code {
+  margin: 16px 0 0;
+  color: #0f172a;
+  font-size: clamp(4rem, 10vw, 6.5rem);
+  line-height: 1;
+  font-weight: 800;
+  letter-spacing: -0.06em;
+}
+
+.legacy-test-not-found__title {
+  margin: 14px 0 0;
+  color: #0f172a;
+  font-size: 1.9rem;
+  font-weight: 800;
+  letter-spacing: -0.04em;
+}
+
+.legacy-test-not-found__subtitle {
+  margin: 14px auto 0;
+  max-width: 48ch;
+  color: #475569;
+  font-size: 1rem;
+  line-height: 1.8;
+}
+
+.legacy-test-not-found__actions {
+  display: flex;
+  justify-content: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 28px;
+}
+
+.legacy-test-not-found__link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 14px 18px;
+  border: 1px solid #cbd5e1;
+  border-radius: 16px;
+  background: #ffffff;
+  color: #0f172a;
+  font-weight: 700;
+  text-decoration: none;
+  transition: transform 160ms ease, border-color 160ms ease, box-shadow 160ms ease;
+}
+
+.legacy-test-not-found__link:hover {
+  transform: translateY(-1px);
+  border-color: #94a3b8;
+}
+
+.legacy-test-not-found__link--primary {
+  border-color: transparent;
+  background: linear-gradient(135deg, #0f172a 0%, #1e3a8a 100%);
+  color: #ffffff;
+  box-shadow: 0 18px 30px rgba(30, 58, 138, 0.18);
+}
+
+@media (max-width: 640px) {
+  .legacy-test-not-found__card {
+    padding: 32px 22px;
+  }
+}

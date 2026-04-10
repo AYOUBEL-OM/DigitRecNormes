@@ -1,0 +1,214 @@
+.legacy-dashboard {
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+
+.legacy-dashboard-state {
+  padding: 22px 24px;
+  border: 1px solid #cbd5e1;
+  border-radius: 24px;
+  background: rgba(255, 255, 255, 0.92);
+  color: #475569;
+  box-shadow: 0 18px 40px rgba(15, 23, 42, 0.08);
+}
+
+.legacy-dashboard-state--error {
+  border-color: #fecaca;
+  background: #fef2f2;
+  color: #b91c1c;
+}
+
+.legacy-dashboard-hero,
+.legacy-dashboard-card {
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 28px;
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: 0 22px 56px rgba(15, 23, 42, 0.08);
+}
+
+.legacy-dashboard-hero {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 28px 30px;
+}
+
+.legacy-dashboard-hero__meta {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 12px;
+}
+
+.legacy-dashboard-hero__eyebrow,
+.legacy-dashboard-card__label,
+.legacy-dashboard-list__label {
+  color: #64748b;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+}
+
+.legacy-dashboard-hero__title {
+  margin: 12px 0 0;
+  color: #0f172a;
+  font-size: clamp(2rem, 4vw, 3.2rem);
+  font-weight: 800;
+  letter-spacing: -0.05em;
+}
+
+.legacy-dashboard-hero__subtitle {
+  margin: 12px 0 0;
+  max-width: 680px;
+  color: #475569;
+  font-size: 0.98rem;
+  line-height: 1.85;
+}
+
+.legacy-dashboard-hero__pill {
+  padding: 10px 16px;
+  border-radius: 999px;
+  background: #eff6ff;
+  color: #1d4ed8;
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.legacy-dashboard-hero__id-card {
+  min-width: 220px;
+  padding: 14px 16px;
+  border: 1px solid #dbeafe;
+  border-radius: 20px;
+  background: linear-gradient(135deg, #eff6ff 0%, #ffffff 100%);
+  text-align: right;
+}
+
+.legacy-dashboard-hero__id-label {
+  color: #64748b;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+
+.legacy-dashboard-hero__id-value {
+  margin-top: 8px;
+  color: #0f172a;
+  font-size: 1.05rem;
+  font-weight: 800;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.legacy-dashboard-overview {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.legacy-dashboard-columns {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+}
+
+.legacy-dashboard-card {
+  padding: 24px;
+}
+
+.legacy-dashboard-card--compact {
+  padding: 20px 22px;
+}
+
+.legacy-dashboard-card__value {
+  margin-top: 12px;
+  color: #0f172a;
+  font-size: 1rem;
+  line-height: 1.7;
+  font-weight: 700;
+  word-break: break-word;
+}
+
+.legacy-dashboard-card__header h2 {
+  margin: 0;
+  color: #0f172a;
+  font-size: 1.2rem;
+  font-weight: 800;
+}
+
+.legacy-dashboard-list {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  margin-top: 22px;
+}
+
+.legacy-dashboard-list__item {
+  padding-bottom: 16px;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.legacy-dashboard-list__item:last-child {
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+
+.legacy-dashboard-list__value {
+  margin-top: 8px;
+  color: #1e293b;
+  font-size: 0.94rem;
+  line-height: 1.8;
+  word-break: break-word;
+}
+
+.legacy-dashboard-code {
+  margin: 20px 0 0;
+  padding: 20px;
+  border-radius: 20px;
+  background: #0f172a;
+  color: #e2e8f0;
+  font-size: 0.78rem;
+  line-height: 1.8;
+  overflow: auto;
+}
+
+@media (max-width: 1080px) {
+  .legacy-dashboard-overview {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .legacy-dashboard-columns {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 640px) {
+  .legacy-dashboard-hero {
+    flex-direction: column;
+    padding: 22px 20px;
+  }
+
+  .legacy-dashboard-hero__meta {
+    width: 100%;
+    align-items: stretch;
+  }
+
+  .legacy-dashboard-hero__id-card {
+    min-width: 0;
+    text-align: left;
+  }
+
+  .legacy-dashboard-overview {
+    grid-template-columns: 1fr;
+  }
+
+  .legacy-dashboard-card {
+    padding: 20px;
+  }
+}

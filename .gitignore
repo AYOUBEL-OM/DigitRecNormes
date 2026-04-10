@@ -1,0 +1,29 @@
+# Dependencies
+Frontend/node_modules/
+backend/.venv/
+backend/venv/
+
+# Environment files
+.env
+.env.*
+!.env.example
+!.env*.example
+!Frontend/.env.local
+
+# Build output
+Frontend/dist/
+Frontend/dist-ssr/
+
+# Python cache
+**/__pycache__/
+*.pyc
+
+# Logs
+*.log
+
+# Editor / OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+!.vscode/extensions.json
