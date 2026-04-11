@@ -42,6 +42,10 @@ class Settings(BaseSettings):
     SMTP_USER: str = ""
     SMTP_PASS: str = ""
     SMTP_FROM: str = ""
+
+    # URL publique du frontend (liens dans les e-mails, ex. page quiz)
+    FRONTEND_PUBLIC_URL: str = "http://localhost:8080"
+
     @property
     def database_url(self) -> str:
         """URL de connexion PostgreSQL pour SQLAlchemy."""

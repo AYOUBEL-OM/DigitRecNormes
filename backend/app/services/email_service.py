@@ -5,6 +5,7 @@ import logging
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from uuid import UUID
 
 from app.config import get_settings
 
@@ -33,12 +34,19 @@ def send_email(to_email: str, subject: str, body: str) -> None:
         server.sendmail(msg["From"], [to_email], msg.as_string())
 
 
-def send_acceptance_email(candidat_email: str, candidat_name: str, job_title: str) -> None:
+def send_acceptance_email(
+    candidat_email: str,
+    candidat_name: str,
+    job_title: str,
+    offre_id: UUID,
+) -> None:
+    base = (settings.FRONTEND_PUBLIC_URL or "http://localhost:8080").rstrip("/")
+    quiz_url = f"{base}/quiz/{offre_id}"
     subject = f"Invitation au Test Écrit - {job_title}"
     body = (
         f"Bonjour {candidat_name},\n\n"
-        f"Votre profil a été retenu pour le poste de {job_title}. Nous vous invitons à passer un test écrit.\n"
-        "Les détails du test vous seront communiqués très prochainement.\n\n"
+        f"Votre profil a été retenu pour le poste de {job_title}. "
+        f"Nous vous invitons à passer un test écrit en cliquant sur ce lien: {quiz_url}\n\n"
         "Cordialement,\n"
         "L'équipe de recrutement.\n"
     )

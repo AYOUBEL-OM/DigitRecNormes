@@ -5,6 +5,7 @@ import json
 import logging
 import os
 from typing import Any, Dict
+from uuid import UUID
 
 import fitz
 from groq import Groq
@@ -155,6 +156,7 @@ def run_cv_filtering_for_candidature(candidature_id: Any, offre_id: Any, cv_abs_
                     candidat_email=candidat_email,
                     candidat_name=candidat_name,
                     job_title=job_title,
+                    offre_id=UUID(str(offre_id)),
                 )
             elif candidature.statut == StatutCandidature.refusee:
                 send_rejection_email(
