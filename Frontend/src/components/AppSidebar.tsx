@@ -94,16 +94,7 @@ export function AppSidebar() {
                   </SidebarMenuButton>
                 </SidebarMenuItem>
               ))}
-              {account?.accountType === "company" ? (
-                <SidebarMenuItem>
-                  <SidebarMenuButton asChild isActive={currentPath.startsWith("/quiz/")}>
-                    <NavLink to={`/quiz/${TEST_QUIZ_OFFRE_UUID}`} end>
-                      <FlaskConical className="mr-2 h-4 w-4" />
-                      {!collapsed ? <span>Test Quiz</span> : null}
-                    </NavLink>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-              ) : null}
+              
             </SidebarMenu>
           </SidebarGroupContent>
         </SidebarGroup>

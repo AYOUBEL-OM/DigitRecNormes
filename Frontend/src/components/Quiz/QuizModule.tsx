@@ -63,14 +63,16 @@ function resolveOffreId(propId: string | undefined, params: Record<string, strin
   return (propId?.trim() || params.offreId?.trim() || params.id?.trim()) ?? "";
 }
 
-function normalizeQuizType(payload: GeneratePayload): QuizKind | null {
+function normalizeQuizType(payload: any): QuizKind | null {
   const t = payload.quiz_type;
   if (t === "qcm" || t === "exercice") return t;
+  
+  // التحقق من EXERCICE إذا كان موجوداً في الـ payload
+  if (payload.EXERCICE || (payload.title != null && payload.description != null)) {
+    return "exercice";
+  }
   if (Array.isArray(payload.questions)) {
     return "qcm";
-  }
-  if (payload.title != null && payload.description != null) {
-    return "exercice";
   }
   return null;
 }
@@ -104,7 +106,6 @@ export function QuizModule({ offreId: offreIdProp }: QuizModuleProps) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  /** Type renvoyé par la génération (aligné sur ``quiz_type`` de l’offre). */
   const [activeKind, setActiveKind] = useState<QuizKind | null>(null);
 
   const [questions, setQuestions] = useState<Question[]>([]);
@@ -122,16 +123,9 @@ export function QuizModule({ offreId: offreIdProp }: QuizModuleProps) {
 
   useEffect(() => {
     const oid = offreId.trim();
-    if (!oid) {
-      setVerifyState("idle");
-      setOffreConfig(null);
-      setVerifyError(null);
-      setVerifyHttpStatus(null);
-      return;
-    }
+    if (!oid) return;
     if (!isValidOffreUuid(oid)) {
       setVerifyState("error");
-      setOffreConfig(null);
       setVerifyHttpStatus(400);
       setVerifyError("Lien invalide ou expiré");
       return;
@@ -139,42 +133,30 @@ export function QuizModule({ offreId: offreIdProp }: QuizModuleProps) {
 
     let cancelled = false;
     setVerifyState("loading");
-    setVerifyError(null);
-    setVerifyHttpStatus(null);
-    setOffreConfig(null);
-
-    api
-      .get<QuizConfigResponse>(`/api/quiz/config/${oid}`)
+    api.get<QuizConfigResponse>(`/api/quiz/config/${oid}`)
       .then(({ data }) => {
-        if (cancelled) return;
-        setOffreConfig(data);
-        setVerifyState("ok");
+        if (!cancelled) {
+          setOffreConfig(data);
+          setVerifyState("ok");
+        }
       })
-      .catch((e: unknown) => {
+      .catch((e) => {
         if (cancelled) return;
         setVerifyState("error");
-        let msg = "";
-        let status: number | null = null;
         if (axios.isAxiosError(e)) {
-          status = e.response?.status ?? null;
-          msg = formatApiDetail(e.response?.data?.detail);
+          setVerifyHttpStatus(e.response?.status ?? null);
+          setVerifyError(formatApiDetail(e.response?.data?.detail) || "Impossible de vérifier l’offre.");
         }
-        setVerifyHttpStatus(status);
-        setVerifyError(msg || "Impossible de vérifier l’offre.");
       });
 
-    return () => {
-      cancelled = true;
-    };
+    return () => { cancelled = true; };
   }, [offreId]);
 
-  const applyGeneratePayload = useCallback((payload: GeneratePayload) => {
+  const applyGeneratePayload = useCallback((payload: any) => {
     const kind = normalizeQuizType(payload);
     if (!kind) {
-      setError("Réponse serveur : type de quiz non reconnu (quiz_type attendu).");
+      setError("Réponse serveur : type de quiz non reconnu.");
       setActiveKind(null);
-      setQuestions([]);
-      setExercice(null);
       return;
     }
 
@@ -183,62 +165,31 @@ export function QuizModule({ offreId: offreIdProp }: QuizModuleProps) {
 
     if (kind === "qcm") {
       setExercice(null);
-      setEvaluation(null);
       setUserCode("");
-      setCurrentPage(0);
-      if (Array.isArray(payload.questions)) {
-        setQuestions(payload.questions);
-      } else {
-        setQuestions([]);
-        setError("Format QCM non reconnu (champ questions manquant).");
-      }
+      setQuestions(Array.isArray(payload.questions) ? payload.questions : []);
     } else {
       setQuestions([]);
-      setScore(null);
-      setUserAnswers({});
+      const exData = payload.EXERCICE || payload;
       setExercice({
-        title: typeof payload.title === "string" ? payload.title : undefined,
-        description: typeof payload.description === "string" ? payload.description : undefined,
-        initial_code: typeof payload.initial_code === "string" ? payload.initial_code : undefined,
+        title: exData.title || "Exercice technique",
+        description: exData.description || "",
+        initial_code: exData.initial_code || "",
       });
-      setUserCode(typeof payload.initial_code === "string" ? payload.initial_code : "");
-      setEvaluation(null);
+      setUserCode(exData.initial_code || "");
     }
   }, []);
 
   const handleGenerate = async () => {
-    if (!offreId) {
-      setError("Identifiant d’offre manquant (prop ou URL).");
-      return;
-    }
-    if (verifyState !== "ok") {
-      setError("L’offre doit être validée avant de générer le test.");
-      return;
-    }
+    if (!offreId || verifyState !== "ok") return;
 
     setLoading(true);
     setError(null);
-    setQuestions([]);
-    setExercice(null);
-    setScore(null);
-    setUserAnswers({});
-    setCurrentPage(0);
-    setEvaluation(null);
-    setActiveKind(null);
-    setUserCode("");
-
     try {
       const { data } = await api.get(`/api/generate/${offreId}`);
-      const payload = (typeof data === "string" ? JSON.parse(data) : data) as GeneratePayload;
+      const payload = typeof data === "string" ? JSON.parse(data) : data;
       applyGeneratePayload(payload);
-    } catch (e: unknown) {
-      let msg = "";
-      if (axios.isAxiosError(e)) {
-        msg = formatApiDetail(e.response?.data?.detail);
-      }
-      setError(
-        msg || "Erreur de génération. Vérifiez la connexion au backend, l’ID d’offre et type_examens_ecrit.",
-      );
+    } catch (e) {
+      setError("Erreur de génération. Vérifiez la connexion au backend.");
     } finally {
       setLoading(false);
     }
@@ -264,301 +215,152 @@ export function QuizModule({ offreId: offreIdProp }: QuizModuleProps) {
       });
       const result = typeof data === "string" ? JSON.parse(data) : data;
       setEvaluation(result);
-      if (typeof result.score === "number" && result.score >= 70) confetti();
+      if (result.score >= 70) confetti();
     } catch {
-      setError("Erreur lors de l’évaluation de la réponse.");
+      setError("Erreur lors de l’évaluation.");
     } finally {
       setLoading(false);
     }
   };
 
-  const missingId = !offreId.trim();
-  const malformedUuid = Boolean(offreId.trim() && !isValidOffreUuid(offreId));
-  const configNotFound =
-    verifyState === "error" &&
-    (verifyHttpStatus === 404 ||
-      verifyHttpStatus === 422 ||
-      /offre introuvable/i.test(verifyError || ""));
-  const showInvalidLinkScreen = missingId || malformedUuid || configNotFound;
-
-  const expectedKind: QuizKind | null =
-    activeKind ??
-    (offreConfig?.quiz_type && isQuizKind(offreConfig.quiz_type) ? offreConfig.quiz_type : null);
-
-  const canGenerate = !missingId && verifyState === "ok";
-
-  const awaitingConfig =
-    !missingId &&
-    isValidOffreUuid(offreId) &&
-    verifyState !== "ok" &&
-    verifyState !== "error";
-
+  // Logic pour l'affichage (Pagination, etc.)
   const totalQcmPages = Math.max(1, Math.ceil(questions.length / QUESTIONS_PER_PAGE));
   const pageStart = currentPage * QUESTIONS_PER_PAGE;
   const pageQuestions = questions.slice(pageStart, pageStart + QUESTIONS_PER_PAGE);
-  const answeredCount = Object.keys(userAnswers).length;
 
-  if (showInvalidLinkScreen) {
+  if (verifyState === "error" && (verifyHttpStatus === 404 || /introuvable/i.test(verifyError || ""))) {
     return (
-      <div className="flex min-h-screen flex-col items-center justify-center bg-background px-6 py-16 font-sans">
-        <div className="w-full max-w-md rounded-2xl border border-border bg-card p-8 text-center shadow-[var(--card-shadow)]">
-          <AlertCircle className="mx-auto mb-4 h-12 w-12 text-destructive" aria-hidden />
-          <h1 className="text-xl font-semibold tracking-tight text-card-foreground">
-            Lien invalide ou expiré
-          </h1>
-          <p className="mt-3 text-sm leading-relaxed text-muted-foreground">
-            Ce lien de test n’est plus valide ou l’identifiant est incorrect. Contactez l’équipe de recrutement
-            pour obtenir une nouvelle invitation.
-          </p>
+      <div className="flex min-h-screen items-center justify-center p-6 text-center">
+        <div className="max-w-md rounded-2xl border bg-card p-8 shadow-lg">
+          <AlertCircle className="mx-auto mb-4 h-12 w-12 text-destructive" />
+          <h1 className="text-xl font-semibold">Lien invalide ou expiré</h1>
+          <p className="mt-3 text-muted-foreground text-sm">Contactez l’équipe de recrutement.</p>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen bg-background py-8 px-4 font-sans text-foreground">
+    <div className="min-h-screen bg-background py-8 px-4 text-foreground">
       <div className="mx-auto max-w-6xl">
         <div className="mb-8 text-center">
-          <div className="mb-4 inline-flex rounded-2xl bg-primary p-3 shadow-lg shadow-primary/20">
+          <div className="mb-4 inline-flex rounded-2xl bg-primary p-3 shadow-lg">
             <BrainCircuit className="h-8 w-8 text-primary-foreground" />
           </div>
-          <h1 className="text-3xl font-bold tracking-tight text-foreground md:text-4xl">
-            Digit<span className="text-primary">REC</span> — Test écrit
-          </h1>
-    
-          {offreId ? (
-            <p className="mt-3 font-mono text-xs text-muted-foreground">
-              Offre : <span className="text-foreground">{offreId}</span>
-            </p>
-          ) : null}
-          {expectedKind ? (
-            <div className="mt-4 flex justify-center">
-              <Badge variant="secondary" className="text-xs uppercase tracking-wide">
-                {activeKind ? "Test en cours — " : "Format prévu — "}
-                {expectedKind === "qcm" ? "QCM" : "Exercice écrit"}
-              </Badge>
-            </div>
-          ) : null}
+          <h1 className="text-3xl font-bold md:text-4xl">Digit<span className="text-primary">REC</span> — Test écrit</h1>
+          {activeKind && (
+             <Badge variant="secondary" className="mt-4 uppercase">Test en cours — {activeKind}</Badge>
+          )}
         </div>
 
-        {!missingId && awaitingConfig ? (
-          <div className="mx-auto mb-8 max-w-2xl rounded-xl border border-border bg-card p-6 shadow-[var(--card-shadow)]">
-            <p className="mb-4 text-sm font-medium text-muted-foreground">Vérification de l’offre…</p>
-            <Skeleton className="mb-2 h-4 w-full max-w-md" />
-            <Skeleton className="h-4 w-full max-w-xs" />
+        {verifyState === "ok" && !activeKind && (
+          <div className="mx-auto mb-8 max-w-2xl rounded-xl border bg-card p-6 shadow-sm">
+            <h2 className="text-lg font-semibold">{offreConfig?.title || "Offre validée"}</h2>
+            <p className="text-sm text-muted-foreground mt-1">{offreConfig?.profile} | {offreConfig?.level}</p>
+            <Button onClick={handleGenerate} disabled={loading} className="mt-6 w-full rounded-xl">
+              {loading && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+              Commencer le test
+            </Button>
           </div>
-        ) : null}
+        )}
 
-        {!missingId && verifyState === "error" && verifyError && !configNotFound ? (
-          <div className="mx-auto mb-8 flex max-w-2xl items-center gap-3 rounded-xl border border-destructive/30 bg-destructive/10 p-4 text-destructive shadow-sm">
-            <AlertCircle className="h-6 w-6 shrink-0" />
-            <span className="text-sm font-semibold">{verifyError}</span>
+        {error && (
+          <div className="mx-auto mb-6 flex max-w-3xl items-center gap-3 rounded-xl bg-destructive/10 p-4 text-destructive border border-destructive/20">
+            <AlertCircle className="h-5 w-5" />
+            <span className="text-sm font-medium">{error}</span>
           </div>
-        ) : null}
+        )}
 
-        {!missingId && verifyState === "ok" && offreConfig ? (
-          <div className="mx-auto mb-8 max-w-2xl rounded-xl border border-border bg-card p-6 text-left shadow-[var(--card-shadow)]">
-            <h2 className="text-lg font-semibold text-card-foreground">
-              {offreConfig.title || "Offre validée"}
-            </h2>
-            {offreConfig.profile ? (
-              <p className="mt-2 text-sm text-muted-foreground">
-                <span className="font-medium text-foreground">Profil : </span>
-                {offreConfig.profile}
-              </p>
-            ) : null}
-            {offreConfig.level ? (
-              <p className="mt-1 text-sm text-muted-foreground">
-                <span className="font-medium text-foreground">Niveau : </span>
-                {offreConfig.level}
-              </p>
-            ) : null}
-            <p className="mt-3 text-xs text-muted-foreground">
-              Type d’examen (offre) :{" "}
-              <code className="rounded bg-muted px-1.5 py-0.5 text-foreground">
-                {offreConfig.type_examens_ecrit ?? "—"}
-              </code>
-              {offreConfig.quiz_type === "qcm" && typeof offreConfig.qcm_question_count === "number" ? (
-                <>
-                  {" "}
-                  · QCM :{" "}
-                  <span className="text-foreground">{offreConfig.qcm_question_count}</span> question
-                  {offreConfig.qcm_question_count > 1 ? "s" : ""} prévues
-                </>
-              ) : null}
-            </p>
-          </div>
-        ) : null}
-
-        <div className="mx-auto mb-10 flex max-w-xl flex-col items-stretch gap-3 sm:flex-row sm:justify-center">
-          <Button
-            type="button"
-            size="lg"
-            className="rounded-2xl px-10 font-semibold"
-            disabled={loading || !canGenerate}
-            onClick={handleGenerate}
-          >
-            {loading ? <Loader2 className="h-5 w-5 animate-spin" /> : null}
-            Générer le test
-          </Button>
-        </div>
-
-        {error ? (
-          <div className="mx-auto mb-8 flex max-w-3xl items-center gap-3 rounded-xl border border-destructive/30 bg-destructive/10 p-4 text-destructive">
-            <AlertCircle className="h-6 w-6 shrink-0" />
-            <span className="text-sm font-semibold">{error}</span>
-          </div>
-        ) : null}
-
-        {activeKind === "qcm" && questions.length > 0 && score === null ? (
-          <div className="mx-auto max-w-4xl animate-in fade-in slide-in-from-bottom-4 space-y-2 duration-300">
-            {pageQuestions.map((q, localIdx) => {
-              const globalIdx = pageStart + localIdx;
-              return (
-                <QuizCard
-                  key={globalIdx}
-                  q={q}
-                  index={globalIdx}
-                  selectedAnswer={userAnswers[globalIdx] ?? null}
-                  onSelect={(qIdx, val) => setUserAnswers((prev) => ({ ...prev, [qIdx]: val }))}
-                />
-              );
-            })}
-
-            <div className="flex flex-col items-center gap-6 border-t border-border pt-8">
-              <div className="flex flex-wrap items-center justify-center gap-3">
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="default"
-                  className="min-w-[8rem] gap-1 rounded-lg"
-                  disabled={currentPage <= 0}
-                  onClick={() => setCurrentPage((p) => Math.max(0, p - 1))}
-                >
-                  <ChevronLeft className="h-4 w-4" />
-                  Précédent
+        {/* --- SECTION QCM --- */}
+        {activeKind === "qcm" && score === null && (
+          <div className="mx-auto max-w-4xl space-y-4">
+            {pageQuestions.map((q, i) => (
+              <QuizCard
+                key={pageStart + i}
+                q={q}
+                index={pageStart + i}
+                selectedAnswer={userAnswers[pageStart + i] ?? null}
+                onSelect={(idx, val) => setUserAnswers(p => ({...p, [idx]: val}))}
+              />
+            ))}
+            <div className="flex flex-col items-center gap-6 mt-8">
+              <div className="flex items-center gap-4">
+                <Button variant="outline" disabled={currentPage === 0} onClick={() => setCurrentPage(p => p - 1)}>
+                  <ChevronLeft className="h-4 w-4 mr-1" /> Précédent
                 </Button>
-                <span className="min-w-[10rem] text-center text-sm tabular-nums text-muted-foreground">
-                  Page {Math.min(currentPage + 1, totalQcmPages)} / {totalQcmPages}
-                  <span className="mt-1 block text-xs">
-                    {answeredCount}/{questions.length} réponse{questions.length > 1 ? "s" : ""}
-                  </span>
-                </span>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="default"
-                  className="min-w-[8rem] gap-1 rounded-lg"
-                  disabled={currentPage >= totalQcmPages - 1}
-                  onClick={() => setCurrentPage((p) => Math.min(totalQcmPages - 1, p + 1))}
-                >
-                  Suivant
-                  <ChevronRight className="h-4 w-4" />
+                <span className="text-sm text-muted-foreground">Page {currentPage + 1} / {totalQcmPages}</span>
+                <Button variant="outline" disabled={currentPage >= totalQcmPages - 1} onClick={() => setCurrentPage(p => p + 1)}>
+                  Suivant <ChevronRight className="h-4 w-4 ml-1" />
                 </Button>
               </div>
-
-              <Button
-                type="button"
-                size="lg"
-                className="rounded-2xl bg-[hsl(var(--success))] px-12 text-[hsl(var(--success-foreground))] hover:bg-[hsl(var(--success))]/90"
-                disabled={answeredCount < questions.length}
+              <Button 
+                size="lg" 
+                className="bg-green-600 hover:bg-green-700 text-white px-12 rounded-2xl"
+                disabled={Object.keys(userAnswers).length < questions.length}
                 onClick={calculateQcmScore}
               >
                 Terminer le test
               </Button>
             </div>
-            <div className="pb-12" />
           </div>
-        ) : null}
+        )}
 
-        {score !== null ? (
-          <div className="mx-auto max-w-lg animate-in zoom-in rounded-3xl border-4 border-primary bg-card p-10 text-center shadow-xl duration-500">
-            <Trophy className="mx-auto mb-4 h-16 w-16 text-[hsl(var(--warning))]" />
-            <h2 className="mb-2 text-2xl font-bold">Résultat</h2>
-            <div className="mb-4 text-7xl font-black text-primary md:text-8xl">{score}%</div>
-            <p className="mb-8 text-lg font-medium text-muted-foreground">
-              {score >= 70 ? "Excellent travail !" : "Continuez vos efforts !"}
-            </p>
-            <Button
-              type="button"
-              variant="ghost"
-              className="gap-2 text-primary"
-              onClick={() => {
-                setScore(null);
-                void handleGenerate();
-              }}
-            >
-              <RotateCcw className="h-4 w-4" />
-              Nouveau test
+        {/* --- SECTION RESULTAT --- */}
+        {score !== null && (
+          <div className="mx-auto max-w-md rounded-3xl border-4 border-primary bg-card p-10 text-center shadow-2xl">
+            <Trophy className="mx-auto mb-4 h-16 w-16 text-yellow-500" />
+            <h2 className="text-2xl font-bold">Votre Score</h2>
+            <div className="my-4 text-7xl font-black text-primary">{score}%</div>
+            <Button variant="ghost" className="mt-4 gap-2" onClick={() => window.location.reload()}>
+              <RotateCcw className="h-4 w-4" /> Recommencer
             </Button>
           </div>
-        ) : null}
+        )}
 
-        {activeKind === "exercice" && exercice ? (
-          <div className="grid min-h-[520px] animate-in fade-in grid-cols-1 gap-6 duration-300 lg:grid-cols-2 lg:gap-8">
-            <div className="overflow-y-auto rounded-xl border border-border bg-card p-8 shadow-[var(--card-shadow)]">
-              <Badge variant="secondary" className="mb-4 uppercase tracking-wide">
-                Exercice technique
-              </Badge>
-              <h2 className="mb-4 text-2xl font-bold text-card-foreground">{exercice.title}</h2>
-              <div className="prose prose-sm max-w-none text-muted-foreground dark:prose-invert">
+        {/* --- SECTION EXERCICE --- */}
+        {activeKind === "exercice" && exercice && (
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 min-h-[500px]">
+            <div className="rounded-xl border bg-card p-8 shadow-sm overflow-y-auto">
+              <Badge className="mb-4">EXERCICE</Badge>
+              <h2 className="text-2xl font-bold mb-4">{exercice.title}</h2>
+              <div className="prose prose-sm dark:prose-invert text-muted-foreground whitespace-pre-wrap">
                 {exercice.description}
               </div>
-
-              {evaluation ? (
-                <div className="mt-8 animate-in zoom-in rounded-2xl bg-primary p-6 text-primary-foreground shadow-lg duration-300">
-                  <div className="mb-2 flex items-center justify-between">
-                    <span className="font-semibold text-primary-foreground/90">Score IA</span>
-                    <span className="text-4xl font-black">{evaluation.score ?? "—"}%</span>
+              {evaluation && (
+                <div className="mt-8 rounded-2xl bg-primary p-6 text-primary-foreground">
+                  <div className="flex justify-between items-center mb-2">
+                    <span className="font-bold">Score IA</span>
+                    <span className="text-3xl font-black">{evaluation.score}%</span>
                   </div>
-                  <p className="text-sm font-medium leading-snug opacity-95">{evaluation.feedback}</p>
+                  <p className="text-sm opacity-90">{evaluation.feedback}</p>
                 </div>
-              ) : null}
+              )}
             </div>
 
-            <div className="relative flex min-h-[400px] flex-col overflow-hidden rounded-xl border border-border bg-[#1e1e1e] shadow-2xl">
-              <div className="flex items-center gap-2 border-b border-[#333] bg-[#2d2d2d] px-4 py-3">
-                <div className="h-2.5 w-2.5 rounded-full bg-red-500" />
-                <div className="h-2.5 w-2.5 rounded-full bg-yellow-500" />
-                <div className="h-2.5 w-2.5 rounded-full bg-green-500" />
-                <span className="ml-3 font-mono text-xs text-muted-foreground">solution.py</span>
+            <div className="flex flex-col rounded-xl border bg-[#1e1e1e] shadow-2xl overflow-hidden relative">
+              <div className="bg-[#2d2d2d] px-4 py-2 border-b border-[#333] flex items-center gap-2">
+                <div className="flex gap-1.5"><div className="w-3 h-3 rounded-full bg-red-500"/><div className="w-3 h-3 rounded-full bg-yellow-500"/><div className="w-3 h-3 rounded-full bg-green-500"/></div>
+                <span className="text-xs text-gray-400 ml-4 font-mono">solution.py</span>
               </div>
-              {!exercice.initial_code || exercice.initial_code.trim() === "" ? (
-                <textarea
-                  className="min-h-[320px] flex-1 resize-none bg-background p-6 text-base text-foreground outline-none"
-                  placeholder="Écrivez votre réponse ici…"
-                  value={userCode}
-                  onChange={(e) => setUserCode(e.target.value)}
-                />
-              ) : (
+              <div className="flex-1 min-h-[400px]">
                 <Editor
                   height="100%"
                   defaultLanguage="python"
                   theme="vs-dark"
                   value={userCode}
                   onChange={(v) => setUserCode(v || "")}
-                  options={{
-                    fontSize: 15,
-                    minimap: { enabled: false },
-                    automaticLayout: true,
-                  }}
+                  options={{ fontSize: 14, minimap: { enabled: false }, automaticLayout: true }}
                 />
-              )}
-              {!evaluation ? (
-                <Button
-                  type="button"
-                  size="lg"
-                  className="absolute bottom-6 right-6 z-10 gap-2 rounded-2xl bg-[hsl(var(--success))] text-[hsl(var(--success-foreground))] hover:bg-[hsl(var(--success))]/90"
-                  disabled={loading}
-                  onClick={() => void submitCode()}
-                >
-                  {loading ? <Loader2 className="h-5 w-5 animate-spin" /> : <Send className="h-5 w-5" />}
-                  Soumettre
+              </div>
+              {!evaluation && (
+                <Button onClick={submitCode} disabled={loading} className="absolute bottom-6 right-6 bg-green-600 hover:bg-green-700 text-white rounded-xl shadow-lg">
+                  {loading ? <Loader2 className="animate-spin h-5 w-5" /> : <Send className="h-5 w-5 mr-2" />}
+                  Soumettre la réponse
                 </Button>
-              ) : null}
+              )}
             </div>
           </div>
-        ) : null}
+        )}
       </div>
     </div>
   );
