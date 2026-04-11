@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from app.config import get_settings
 from app.routers import auth_entreprise, auth_candidat, offres, candidatures
 from app.routers.dashboard import router as dashboard_router
+from app.api.endpoints import quiz as quiz_endpoints
 
 settings = get_settings()
 
@@ -45,6 +46,7 @@ app.include_router(auth_candidat.router, prefix="/api")
 app.include_router(offres.router, prefix="/api")
 app.include_router(candidatures.router, prefix="/api")
 app.include_router(dashboard_router, prefix="/api")
+app.include_router(quiz_endpoints.router, prefix="/api")
 
 # Static files
 _upload_cv_dir = Path(settings.UPLOAD_DIR)

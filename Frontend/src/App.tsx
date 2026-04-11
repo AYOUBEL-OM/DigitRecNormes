@@ -18,6 +18,8 @@ import Profile from "./pages/Profile";
 import Register from "./pages/Register";
 import SettingsPage from "./pages/Settings";
 import RegisterCandidate from "./pages/Registre_candidat";
+import { QuizModule } from "./components/Quiz/QuizModule";
+import { QuizPublicLayout } from "./components/Quiz/QuizPublicLayout";
 
 
 const queryClient = new QueryClient();
@@ -50,6 +52,9 @@ const App = () => (
               <Route path="applications" element={<Applications />} />
               <Route path="candidates" element={<Candidates />} />
               <Route path="settings" element={<SettingsPage />} />
+            </Route>
+            <Route path="/quiz/:offreId" element={<QuizPublicLayout />}>
+              <Route index element={<QuizModule />} />
             </Route>
             <Route path="*" element={<NotFound />} />
           </Routes>
