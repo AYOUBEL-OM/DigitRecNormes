@@ -2,14 +2,16 @@
 Connexion à la base de données PostgreSQL via SQLAlchemy.
 """
 
-import os
+from pathlib import Path
+
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 from app.config import get_settings
 
-# Charger .env automatiquement
-load_dotenv()
+# Charger backend/.env même si le processus n’est pas lancé depuis ce dossier
+_BACKEND_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(_BACKEND_ROOT / ".env")
 
 # 📌 DATABASE URL من config
 settings = get_settings()

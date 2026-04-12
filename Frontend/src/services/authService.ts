@@ -148,17 +148,36 @@ export function signInWithPassword(
         ? { email, mot_de_passe: password }
         : { email_prof: email, mot_de_passe: password };
 
+    // Connexion « propre » : évite qu’un ancien JWT ne soit mélangé à la requête côté extensions / onglets.
+    clearAuthStorage();
+
     const res = await fetch(`${API_BASE_URL}${path}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
       body: JSON.stringify(payload),
+      cache: "no-store",
+      credentials: "omit",
     });
 
     if (!res.ok) {
       const text = await res.text();
-      throw new Error(
-        text || "Email ou mot de passe incorrect",
-      );
+      let message = "Email ou mot de passe incorrect";
+      try {
+        const parsed = JSON.parse(text) as { detail?: unknown };
+        if (typeof parsed.detail === "string") {
+          message = parsed.detail;
+        } else if (Array.isArray(parsed.detail)) {
+          message = parsed.detail
+            .map((d: { msg?: string }) => d?.msg || String(d))
+            .join(", ");
+        }
+      } catch {
+        if (text) message = text;
+      }
+      throw new Error(message);
     }
 
     const data = await res.json();

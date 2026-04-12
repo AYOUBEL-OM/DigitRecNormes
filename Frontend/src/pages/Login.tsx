@@ -50,8 +50,13 @@ const LoginCompany = () => {
     setMessage("");
     const stopLoading = startLoading();
 
-    const emailTrim = email.trim();
-    if (!emailTrim || !password) {
+    // Valeurs lues sur le formulaire au moment du submit (évite décalage React / gestionnaire de mots de passe).
+    const form = event.currentTarget;
+    const fd = new FormData(form);
+    const emailTrim = String(fd.get("email") ?? "").trim();
+    const passwordFromForm = String(fd.get("password") ?? "");
+
+    if (!emailTrim || !passwordFromForm) {
       const err = "Veuillez saisir votre e-mail et votre mot de passe.";
       setMessage(err);
       toast.error(err);
@@ -71,7 +76,7 @@ const LoginCompany = () => {
     }
 
     try {
-      const result = await signInWithPassword(emailTrim, password, "entreprise");
+      const result = await signInWithPassword(emailTrim, passwordFromForm, "entreprise");
 
       if (result.error) {
         setMessage(result.error.message);
@@ -129,6 +134,7 @@ const LoginCompany = () => {
           </label>
           <input
             id="test-login-email"
+            name="email"
             className="legacy-auth-input"
             type="email"
             autoComplete="email"
@@ -144,6 +150,7 @@ const LoginCompany = () => {
           </label>
           <input
             id="test-login-password"
+            name="password"
             className="legacy-auth-input"
             type="password"
             autoComplete="current-password"

@@ -9,12 +9,23 @@ export const api = axios.create({
 });
 
 api.interceptors.request.use((config) => {
-  const token = localStorage.getItem("access_token");
-  
-  // N-zido check: ila kante l-request jaya mn l-quiz, ma-nsiftouch l-token darori
-  // awla n-khlliw l-backend hwa li y-decidi.
-  if (token && !config.url?.includes('/quiz/')) {
-    config.headers.Authorization = `Bearer ${token}`;
+  const url = config.url ?? "";
+
+  // Soumission du test : identité portée par le corps (id_candidature), pas le JWT app
+  if (url.includes("/quiz/submit-test-result")) {
+    return config;
+  }
+
+  const localToken = localStorage.getItem("access_token");
+
+  const isQuizPublic =
+    url.includes("/quiz/") && !url.includes("/quiz/submit-test-result");
+  const isAuthAnonymous =
+    /\/api\/auth\/[^/]+\/(login|inscription)/.test(url) ||
+    url.includes("/api/auth/candidat/inscription");
+
+  if (localToken && !isQuizPublic && !isAuthAnonymous) {
+    config.headers.Authorization = `Bearer ${localToken}`;
   }
   return config;
 });

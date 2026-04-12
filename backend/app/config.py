@@ -1,8 +1,13 @@
 """
 Configuration de l'application via variables d'environnement.
 """
+from pathlib import Path
+
 from pydantic_settings import BaseSettings
 from functools import lru_cache
+
+# Répertoire backend/ (pour .env même si uvicorn est lancé depuis un autre cwd)
+_BACKEND_ROOT = Path(__file__).resolve().parent.parent
 
 
 class Settings(BaseSettings):
@@ -34,7 +39,9 @@ class Settings(BaseSettings):
     ALLOWED_CV_EXTENSIONS: str = "pdf,doc,docx"
 
     SUPABASE_URL: str = "https://rhedlvxkmbugidditvow.supabase.co"
+    # Service role (recommandé) ; SUPABASE_KEY sert de repli si présent dans .env
     SUPABASE_SERVICE_KEY: str = ""
+    SUPABASE_KEY: str = ""
     GROQ_API_KEY: str = ""
     GROQ_MODEL: str = "llama-3.1-70b-versatile"
     SMTP_HOST: str = ""
@@ -45,6 +52,11 @@ class Settings(BaseSettings):
 
     # URL publique du frontend (liens dans les e-mails, ex. page quiz)
     FRONTEND_PUBLIC_URL: str = "http://localhost:8080"
+
+    @property
+    def supabase_key_resolved(self) -> str:
+        """Clé API Supabase (service role ou clé alternative depuis .env)."""
+        return (self.SUPABASE_SERVICE_KEY or self.SUPABASE_KEY or "").strip()
 
     @property
     def database_url(self) -> str:
@@ -66,7 +78,7 @@ class Settings(BaseSettings):
         return f"{base_url}?sslmode={self.POSTGRES_SSL_MODE}"
 
     class Config:
-        env_file = ".env"
+        env_file = str(_BACKEND_ROOT / ".env")
         env_file_encoding = "utf-8"
         case_sensitive = True
         extra = "ignore"
