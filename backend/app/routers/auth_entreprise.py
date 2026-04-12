@@ -64,8 +64,11 @@ def login(data: EntrepriseLogin, db: Session = Depends(get_db)):
             "user": {
                 "id": str(user.id),
                 "email": user.email_prof,
-                "type": "entreprise"
-            }
+                "email_prof": user.email_prof,
+                "nom": user.nom,
+                "description": getattr(user, "description", None),
+                "type": "entreprise",
+            },
         }
        
     except HTTPException:

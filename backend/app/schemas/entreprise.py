@@ -23,6 +23,18 @@ class EntrepriseUpdate(BaseModel):
     mot_de_passe: Optional[str] = Field(None, min_length=8, max_length=72)  # ✅ 72
 
 
+class EntrepriseMePatch(BaseModel):
+    """Mise à jour partielle du profil entreprise (authentifié)."""
+
+    nom: Optional[str] = Field(None, min_length=1, max_length=255)
+    description: Optional[str] = Field(None, max_length=10_000)
+
+
+class EntrepriseChangePassword(BaseModel):
+    ancien_mot_de_passe: str = Field(..., min_length=1, max_length=128)
+    nouveau_mot_de_passe: str = Field(..., min_length=8, max_length=72)
+
+
 class EntrepriseLogin(BaseModel):
     email_prof: EmailStr
     mot_de_passe: str

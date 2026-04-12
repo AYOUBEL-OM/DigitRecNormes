@@ -65,17 +65,67 @@ async function run<T>(task: () => Promise<T>): Promise<ServiceResult<T>> {
   }
 }
 
+const AUTH_STORAGE_KEYS = ["access_token", "user"] as const;
+
+export function clearAuthStorage() {
+  for (const key of AUTH_STORAGE_KEYS) {
+    localStorage.removeItem(key);
+  }
+}
+
 export function getSession() {
   return run(async () => {
     const token = localStorage.getItem("access_token");
-    if (!token) return null;
-    return { access_token: token };
+    const userJson = localStorage.getItem("user");
+    if (!token || !userJson?.trim()) {
+      return null;
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(userJson);
+    } catch {
+      clearAuthStorage();
+      return null;
+    }
+
+    if (
+      parsed === null ||
+      typeof parsed !== "object" ||
+      Array.isArray(parsed)
+    ) {
+      clearAuthStorage();
+      return null;
+    }
+
+    return {
+      access_token: token,
+      user: parsed as Record<string, unknown>,
+    };
   });
 }
 
 const API_BASE_URL =
   (import.meta.env as Record<string, string | undefined>).VITE_API_BASE_URL ??
   "http://localhost:8000";
+
+/** Base API sans slash final (ex. http://localhost:8000). */
+export function getApiBaseUrl(): string {
+  return API_BASE_URL.replace(/\/$/, "");
+}
+
+/**
+ * Rend une URL utilisable dans le navigateur : les chemins relatifs (/uploads/...)
+ * pointent vers l’API FastAPI, pas vers le serveur Vite (sinon 404 SPA).
+ */
+export function resolveApiAssetUrl(href: string | null | undefined): string | null {
+  if (!href?.trim()) return null;
+  const u = href.trim();
+  if (u.startsWith("http://") || u.startsWith("https://")) return u;
+  const base = getApiBaseUrl();
+  const path = u.startsWith("/") ? u : `/${u}`;
+  return `${base}${path}`;
+}
 
 export async function apiFetch(endpoint: string, options: RequestInit = {}) {
   const token = localStorage.getItem("access_token");
@@ -188,14 +238,6 @@ export function signInWithPassword(
   });
 }
 
-const AUTH_STORAGE_KEYS = ["access_token", "user"] as const;
-
-export function clearAuthStorage() {
-  for (const key of AUTH_STORAGE_KEYS) {
-    localStorage.removeItem(key);
-  }
-}
-
 export function signOut() {
   return run(async () => {
     clearAuthStorage();
@@ -250,5 +292,141 @@ export function registerCompany(payload: CompanyRegistrationPayload) {
     if (!response.ok) throw new Error(await response.text());
 
     return response.json();
+  });
+}
+
+export type EntrepriseCandidatureItem = {
+  id: string;
+  offre_id: string;
+  candidat_nom: string;
+  offre_titre: string | null;
+  statut: string;
+  score_ia: number | null;
+};
+
+export type OffreEntrepriseItem = {
+  id: string;
+  title: string | null;
+  status: string | null;
+};
+
+export type CandidatureDetailsResponse = {
+  candidate: {
+    nom: string;
+    prenom: string;
+    email: string;
+    cin: string | null;
+    cv_url: string | null;
+  };
+  scores: {
+    score_cv_matching: number | null;
+    score_ecrit: number | null;
+    score_oral: number | null;
+  };
+  status: {
+    statut: string;
+    etape_actuelle: string | null;
+  };
+  offre_titre: string | null;
+};
+
+export function getCandidatures() {
+  return run(async () => {
+    const data = await apiFetch("/api/entreprises/me/candidatures");
+    return data as EntrepriseCandidatureItem[];
+  });
+}
+
+export function getOffresEntreprise() {
+  return run(async () => {
+    const data = await apiFetch("/api/offres");
+    return data as OffreEntrepriseItem[];
+  });
+}
+
+export function getCandidatureDetails(candidatureId: string) {
+  return run(async () => {
+    const data = await apiFetch(
+      `/api/entreprises/me/candidatures/${encodeURIComponent(candidatureId)}/details`,
+    );
+    return data as CandidatureDetailsResponse;
+  });
+}
+
+export type DashboardRecrutementItem = {
+  title: string;
+  count_candidats: number;
+  progression: number;
+  stage: string;
+};
+
+export type DashboardStatsResponse = {
+  nom_entreprise: string;
+  total_candidats: number;
+  offres_actives: number;
+  entretiens_prevus: number;
+  taux_conversion: number;
+  recrutements_en_cours: DashboardRecrutementItem[];
+};
+
+export function getDashboardStats() {
+  return run(async () => {
+    const data = await apiFetch("/api/entreprises/me/dashboard-stats");
+    return data as DashboardStatsResponse;
+  });
+}
+
+export type EnterpriseProfile = {
+  id: string;
+  nom: string;
+  email_prof: string;
+  description: string | null;
+};
+
+/** Met à jour le JSON `user` en localStorage après un PATCH profil (même onglet). */
+export function mergeStoredEnterpriseUser(profile: EnterpriseProfile): void {
+  const raw = localStorage.getItem("user");
+  if (!raw?.trim()) return;
+  let u: Record<string, unknown>;
+  try {
+    u = JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    return;
+  }
+  if (u.type !== "entreprise") return;
+  u.nom = profile.nom;
+  u.email = profile.email_prof;
+  u.email_prof = profile.email_prof;
+  u.description = profile.description;
+  localStorage.setItem("user", JSON.stringify(u));
+  window.dispatchEvent(new Event("digitrec:session-update"));
+}
+
+export function getEnterpriseProfile() {
+  return run(async () => {
+    const data = await apiFetch("/api/entreprises/me");
+    return data as EnterpriseProfile;
+  });
+}
+
+export function updateProfile(payload: { nom?: string; description?: string | null }) {
+  return run(async () => {
+    const data = await apiFetch("/api/entreprises/me", {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    });
+    return data as EnterpriseProfile;
+  });
+}
+
+export function changePassword(ancienMotDePasse: string, nouveauMotDePasse: string) {
+  return run(async () => {
+    return apiFetch("/api/entreprises/me/change-password", {
+      method: "POST",
+      body: JSON.stringify({
+        ancien_mot_de_passe: ancienMotDePasse,
+        nouveau_mot_de_passe: nouveauMotDePasse,
+      }),
+    });
   });
 }

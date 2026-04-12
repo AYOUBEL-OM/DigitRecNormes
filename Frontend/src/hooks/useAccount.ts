@@ -33,9 +33,9 @@ export function useAccount() {
 
   useEffect(() => {
     let active = true;
-    const stopLoading = startLoading();
 
     const loadAccount = () => {
+      const stopLoading = startLoading();
       try {
         const token = localStorage.getItem("access_token");
         const userJson = localStorage.getItem("user");
@@ -85,10 +85,12 @@ export function useAccount() {
     };
 
     loadAccount();
+    const onSessionUpdate = () => loadAccount();
+    window.addEventListener("digitrec:session-update", onSessionUpdate);
 
     return () => {
       active = false;
-      stopLoading();
+      window.removeEventListener("digitrec:session-update", onSessionUpdate);
     };
   }, [startLoading]);
 

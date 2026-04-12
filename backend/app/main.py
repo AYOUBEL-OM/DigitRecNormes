@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from app.config import get_settings
-from app.routers import auth_entreprise, auth_candidat, offres, candidatures
+from app.routers import auth_entreprise, auth_candidat, offres, candidatures, entreprises
 from app.routers.dashboard import router as dashboard_router
 from app.api.endpoints import quiz as quiz_endpoints
 
@@ -45,6 +45,7 @@ app.include_router(auth_entreprise.router, prefix="/api")
 app.include_router(auth_candidat.router, prefix="/api")
 app.include_router(offres.router, prefix="/api")
 app.include_router(candidatures.router, prefix="/api")
+app.include_router(entreprises.router, prefix="/api")
 app.include_router(dashboard_router, prefix="/api")
 app.include_router(quiz_endpoints.router, prefix="/api")
 

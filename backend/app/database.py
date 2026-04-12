@@ -20,8 +20,6 @@ DATABASE_URL = settings.database_url
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL is not set in environment variables")
 
-print(f"🔧 DATABASE_URL={DATABASE_URL}")
-
 # 📌 Engine
 engine = create_engine(
     DATABASE_URL,

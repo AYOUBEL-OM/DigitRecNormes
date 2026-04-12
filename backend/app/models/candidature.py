@@ -40,6 +40,7 @@ class Candidature(Base):
     score_cv_matching = Column(Float, nullable=True)
     cv_analysis_report = Column(Text, nullable=True)
     statut = Column(Enum(StatutCandidature), default=StatutCandidature.nouvelle)
+    etape_actuelle = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 

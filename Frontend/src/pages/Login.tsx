@@ -1,9 +1,9 @@
-import { FormEvent, useEffect, useRef, useState } from "react";
+import { FormEvent, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import { useLoadingBar } from "../components/LoadingBarProvider";
 import AuthShell from "../components/AuthShell";
-import { getSession, signInWithPassword } from "../services/authService";
+import { signInWithPassword } from "../services/authService";
 import { isValidEmail } from "@/lib/validation";
 
 const LoginCompany = () => {
@@ -14,32 +14,6 @@ const LoginCompany = () => {
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(false);
   const submitGuardRef = useRef(false);
-
-  useEffect(() => {
-    let active = true;
-    const stopLoading = startLoading();
-
-    const checkSession = async () => {
-      try {
-        const sessionResult = await getSession();
-
-        if (!active) return;
-
-        if (sessionResult.data) {
-          navigate("/dashboard", { replace: true });
-        }
-      } finally {
-        stopLoading();
-      }
-    };
-
-    checkSession();
-
-    return () => {
-      active = false;
-      stopLoading();
-    };
-  }, [navigate, startLoading]);
 
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
