@@ -1,14 +1,16 @@
 import { useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
-import { Users, Briefcase, CalendarCheck, TrendingUp } from "lucide-react";
+import { Users, Briefcase, CalendarCheck, TrendingUp, CreditCard } from "lucide-react";
 import { Progress } from "@/components/ui/progress";
 import { Button } from "@/components/ui/button";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useNavigate } from "react-router-dom";
 import { useAccount } from "@/hooks/useAccount";
 import {
   getDashboardStats,
   type DashboardStatsResponse,
 } from "@/services/authService";
+import { fetchSubscriptionMe, type SubscriptionMe } from "@/services/subscriptionService";
 
 const fadeUp = {
   hidden: { opacity: 0, y: 20 },
@@ -27,6 +29,7 @@ const Dashboard = () => {
   const [stats, setStats] = useState<DashboardStatsResponse | null>(null);
   const [loading, setLoading] = useState(isCompany);
   const [error, setError] = useState<string | null>(null);
+  const [subscription, setSubscription] = useState<SubscriptionMe | null>(null);
 
   const loadStats = async () => {
     setLoading(true);
@@ -37,6 +40,13 @@ const Dashboard = () => {
       setStats(null);
     } else {
       setStats(data ?? null);
+    }
+    if (isCompany) {
+      try {
+        setSubscription(await fetchSubscriptionMe());
+      } catch {
+        setSubscription(null);
+      }
     }
     setLoading(false);
   };
@@ -96,6 +106,29 @@ const Dashboard = () => {
 
   const pipelines = stats?.recrutements_en_cours ?? [];
 
+  const quotaLine = (() => {
+    if (!subscription?.has_active_subscription) return null;
+    const used = subscription.offers_used ?? subscription.active_offers_count ?? 0;
+    const lim = subscription.offers_limit ?? subscription.max_active_offers;
+    if (subscription.is_trial && lim != null) {
+      const suffix = used > 1 ? "offres utilisées" : "offre utilisée";
+      return `Essai gratuit : ${used} / ${lim} ${suffix}`;
+    }
+    if (lim == null) {
+      return `Pack illimité : ${used} offre(s) active(s)`;
+    }
+    return `${subscription.plan_label ?? "Pack limité"} : ${used} / ${lim} offre(s) active(s)`;
+  })();
+
+  const canCreate =
+    !isCompany ||
+    (subscription != null &&
+      subscription.has_active_subscription === true &&
+      subscription.can_create_offer !== false);
+  const createBlockedReason =
+    subscription?.message?.trim() ||
+    "Vous avez utilisé votre offre gratuite. Veuillez choisir un pack pour créer de nouvelles offres.";
+
   return (
     <div className="space-y-8">
       <div className="flex items-center justify-between">
@@ -111,7 +144,22 @@ const Dashboard = () => {
           </p>
         </div>
         {isCompany ? (
-          <Button onClick={() => navigate("/dashboard/offers/new")}>+ Nouvelle offre</Button>
+          canCreate ? (
+            <Button onClick={() => navigate("/dashboard/new-offer")}>+ Nouvelle offre</Button>
+          ) : (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span className="inline-flex">
+                  <Button disabled className="pointer-events-none opacity-60">
+                    + Nouvelle offre
+                  </Button>
+                </span>
+              </TooltipTrigger>
+              <TooltipContent side="bottom" className="max-w-xs text-center">
+                {createBlockedReason}
+              </TooltipContent>
+            </Tooltip>
+          )
         ) : null}
       </div>
 
@@ -123,6 +171,66 @@ const Dashboard = () => {
 
       {error && isCompany ? (
         <p className="text-sm text-destructive">{error}</p>
+      ) : null}
+
+      {isCompany ? (
+        <motion.div
+          initial="hidden"
+          animate="visible"
+          variants={fadeUp}
+          custom={0}
+          className="flex flex-col gap-3 rounded-xl border bg-card p-5 card-shadow sm:flex-row sm:items-center sm:justify-between"
+        >
+          <div className="flex items-start gap-3">
+            <div className="rounded-lg bg-secondary p-2.5 text-accent">
+              <CreditCard className="h-5 w-5" />
+            </div>
+            <div>
+              <p className="text-sm font-medium text-foreground">Abonnement</p>
+              {subscription?.has_active_subscription ? (
+                <div className="mt-1 space-y-1 text-sm text-muted-foreground">
+                  <p>
+                    <span className="font-semibold text-foreground">
+                      Plan actuel : {subscription.plan_label ?? subscription.plan_code}
+                    </span>
+                    {subscription.status ? ` · ${subscription.status}` : null}
+                  </p>
+                  {quotaLine ? <p>{quotaLine}</p> : null}
+                  {subscription.payment_required && subscription.end_date ? (
+                    <p>
+                      Fin de période :{" "}
+                      {new Date(subscription.end_date).toLocaleDateString("fr-FR")}
+                    </p>
+                  ) : null}
+                  {!subscription.can_create_offer && subscription.message ? (
+                    <p className="font-medium text-amber-700 dark:text-amber-400">
+                      {subscription.message}
+                    </p>
+                  ) : subscription.trial_exhausted ? (
+                    <p className="font-medium text-amber-700 dark:text-amber-400">
+                      Vous avez utilisé votre offre gratuite. Veuillez choisir un pack pour continuer.
+                    </p>
+                  ) : null}
+                </div>
+              ) : (
+                <p className="mt-1 text-sm text-muted-foreground">
+                  Aucune formule active — contactez le support ou reconnectez-vous.
+                </p>
+              )}
+            </div>
+          </div>
+          <div className="flex shrink-0 flex-col gap-2 sm:items-end">
+            <Button variant="outline" onClick={() => navigate("/dashboard/pricing")}>
+              {!subscription?.can_create_offer && subscription?.is_trial
+                ? "Choisir un pack"
+                : subscription?.trial_exhausted
+                  ? "Choisir un pack"
+                  : subscription?.has_active_subscription
+                    ? "Formules et paiement"
+                    : "Voir les formules"}
+            </Button>
+          </div>
+        </motion.div>
       ) : null}
 
       {isCompany ? (

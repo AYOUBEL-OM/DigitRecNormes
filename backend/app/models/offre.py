@@ -1,6 +1,6 @@
 from sqlalchemy import Column, Text, Integer, DateTime, ForeignKey, String
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import relationship, synonym
+from sqlalchemy.orm import relationship
 from datetime import datetime
 import uuid
 
@@ -33,12 +33,20 @@ class Offre(Base):
     type_contrat = Column("type_contrat", Text, nullable=True)
     localisation = Column("localisation", Text, nullable=True)
 
-    # Mapping to the actual database column with spaces and accents
-    competences = Column("Compétences requises", Text, nullable=True)
+    # Colonne PG : identifiant "Compétences requises" (guillemets). Sans `key="competences"`,
+    # SQLAlchemy utilise le nom SQL comme clé dans Table.c et l’hydratation vers l’attribut
+    # Python `competences` ne reçoit pas la valeur (reste None).
+    competences = Column(
+        "Compétences requises",
+        Text,
+        nullable=True,
+        quote=True,
+        key="competences",
+    )
 
-    # Mapping to 'niveau_etude' and providing 'level' as a synonym for Pydantic alignment
+    # Niveau d’expérience requis (Junior / Confirmé / Senior) — colonne distincte de `niveau_etude`.
+    level = Column("level", Text, nullable=True)
     niveau_etude = Column("niveau_etude", Text, nullable=True)
-    level = synonym("niveau_etude")
 
     created_at = Column("created_at", DateTime(timezone=True), default=datetime.utcnow)
 

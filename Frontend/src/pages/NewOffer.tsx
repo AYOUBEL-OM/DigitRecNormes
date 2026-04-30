@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { motion } from "framer-motion";
 import { ArrowLeft, Plus, X } from "lucide-react";
 import { useNavigate } from "react-router-dom";
@@ -10,7 +10,12 @@ import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
 import { useToast } from "@/hooks/use-toast";
-import { apiFetch } from "@/services/authService";
+import { ApiError, apiFetch } from "@/services/authService";
+import { fetchSubscriptionMe, type SubscriptionMe } from "@/services/subscriptionService";
+import {
+  OFFER_EXPERIENCE_LEVELS,
+  isValidOfferExperienceLevel,
+} from "@/constants/offerExperienceLevel";
 
 const contractTypes = ["CDI", "CDD", "Freelance", "Stage", "Alternance"];
 const examTypes = ["QCM", "Exercice"];
@@ -31,9 +36,42 @@ const sectionTextClass = "text-sm text-muted-foreground";
 const badgeClass =
   "cursor-pointer select-none rounded-full px-4 py-2 text-sm transition-all";
 
+const selectClassName =
+  "flex h-11 w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50";
+
 const NewOfferInner = () => {
   const { toast } = useToast();
   const navigate = useNavigate();
+
+  const [subscription, setSubscription] = useState<SubscriptionMe | null>(null);
+  const [subscriptionLoaded, setSubscriptionLoaded] = useState(false);
+
+  /** Après chargement : false si pas d’abonnement actif ou quota épuisé. Pendant le chargement : true (bouton bloqué par subscriptionLoaded). */
+  const canCreateOffer =
+    !subscriptionLoaded ||
+    (subscription != null &&
+      subscription.has_active_subscription === true &&
+      subscription.can_create_offer !== false);
+  const quotaHint =
+    subscription?.message?.trim() ||
+    "Vous avez utilisé votre offre gratuite. Veuillez choisir un pack pour créer de nouvelles offres.";
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const me = await fetchSubscriptionMe();
+        if (!cancelled) setSubscription(me);
+      } catch {
+        if (!cancelled) setSubscription(null);
+      } finally {
+        if (!cancelled) setSubscriptionLoaded(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const [title, setTitle] = useState("");
   const [profile, setProfile] = useState("");
@@ -78,21 +116,31 @@ const NewOfferInner = () => {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
 
-    if (!title || !descriptionPostes || !level) {
+    if (!title || !descriptionPostes || !level || !isValidOfferExperienceLevel(level)) {
       toast({
         title: "Champs requis manquants",
         description:
-          "Veuillez renseigner l’intitulé du poste, le niveau requis et la description.",
+          "Veuillez renseigner l’intitulé du poste, la description et un niveau d’expérience (Junior, Confirmé ou Senior).",
         variant: "destructive",
       });
       return;
     }
 
     if (isSubmitting) return;
+    if (!subscriptionLoaded || !canCreateOffer) {
+      toast({
+        title: "Quota atteint",
+        description: quotaHint,
+        variant: "destructive",
+      });
+      navigate("/dashboard/pricing");
+      return;
+    }
+
     setIsSubmitting(true);
 
     try {
-      const token = localStorage.getItem("access_token");
+      const token = localStorage.getItem("entreprise_access_token");
 
       if (!token) {
         toast({
@@ -138,6 +186,15 @@ const NewOfferInner = () => {
       setGeneratedLink(data.lien_candidature || "");
     } catch (err) {
       console.error(err);
+      if (err instanceof ApiError && err.status === 403) {
+        toast({
+          title: "Création impossible",
+          description: err.message || quotaHint,
+          variant: "destructive",
+        });
+        navigate("/dashboard/pricing");
+        return;
+      }
       toast({
         title: "Erreur",
         description: "Impossible de créer l’offre pour le moment.",
@@ -171,12 +228,34 @@ const NewOfferInner = () => {
         </div>
       </div>
 
+      {subscriptionLoaded &&
+      subscription &&
+      (!subscription.has_active_subscription || subscription.can_create_offer === false) ? (
+        <div className="rounded-xl border border-amber-500/50 bg-amber-500/10 px-4 py-3 text-sm text-amber-950 dark:text-amber-100">
+          <p className="font-medium">{quotaHint}</p>
+          <Button
+            type="button"
+            variant="secondary"
+            className="mt-3"
+            onClick={() => navigate("/dashboard/pricing")}
+          >
+            Choisir un pack
+          </Button>
+        </div>
+      ) : null}
+
       <motion.form
         initial={{ opacity: 0, y: 18 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.35 }}
         onSubmit={handleSubmit}
-        className="space-y-6"
+        className={`space-y-6 ${
+          subscriptionLoaded &&
+          subscription &&
+          (!subscription.has_active_subscription || subscription.can_create_offer === false)
+            ? "pointer-events-none opacity-50"
+            : ""
+        }`}
       >
         <section className={cardClass}>
           <div className="space-y-1">
@@ -192,7 +271,7 @@ const NewOfferInner = () => {
               <Label htmlFor="title">Intitulé du poste *</Label>
               <Input
                 id="title"
-                placeholder="Ex. Développeur /concepteur logiciel"
+                placeholder="Ex. Responsable marketing, Comptable, Développeur web"
                 value={title}
                 onChange={(e) => setTitle(e.target.value)}
               />
@@ -202,7 +281,7 @@ const NewOfferInner = () => {
               <Label htmlFor="profile">Profil recherché</Label>
               <Input
                 id="profile"
-                placeholder="Ex. Développeur full stack /Ingénieur logiciel"
+                placeholder="Ex. Profil junior en marketing digital, Comptable confirmé, Développeur Full Stack"
                 value={profile}
                 onChange={(e) => setProfile(e.target.value)}
               />
@@ -214,7 +293,7 @@ const NewOfferInner = () => {
               <Label htmlFor="localisation">Localisation</Label>
               <Input
                 id="localisation"
-                placeholder="Ex. Casablanca / Remote"
+                placeholder="Ex. Casablanca, Rabat, Hybride, Remote"
                 value={localisation}
                 onChange={(e) => setLocalisation(e.target.value)}
               />
@@ -250,12 +329,20 @@ const NewOfferInner = () => {
           <div className="grid gap-5 md:grid-cols-2">
             <div className="space-y-2">
               <Label htmlFor="level">Niveau requis *</Label>
-              <Input
+              <select
                 id="level"
-                placeholder="Ex. Junior / Confirmé / Senior"
                 value={level}
                 onChange={(e) => setLevel(e.target.value)}
-              />
+                className={selectClassName}
+                required
+              >
+                <option value="">Sélectionner un niveau d’expérience</option>
+                {OFFER_EXPERIENCE_LEVELS.map((opt) => (
+                  <option key={opt} value={opt}>
+                    {opt}
+                  </option>
+                ))}
+              </select>
             </div>
 
             <div className="space-y-2">
@@ -294,7 +381,7 @@ const NewOfferInner = () => {
                 id="niveau-etude"
                 value={niveauEtude}
                 onChange={(e) => setNiveauEtude(e.target.value)}
-                className="flex h-11 w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none"
+                className={selectClassName}
               >
                 <option value="">Sélectionner un niveau d’études</option>
                 {educationLevels.map((item) => (
@@ -310,7 +397,7 @@ const NewOfferInner = () => {
             <Label>Compétences requises</Label>
             <div className="flex gap-2">
               <Input
-                placeholder="Ex. React, Node.js, PostgreSQL"
+                placeholder="Ex. Communication, Excel, Gestion de projet, React, Comptabilité"
                 value={skillInput}
                 onChange={(e) => setSkillInput(e.target.value)}
                 onKeyDown={handleKeyDown}
@@ -419,7 +506,7 @@ const NewOfferInner = () => {
             <Label htmlFor="description-poste">Description détaillée *</Label>
             <Textarea
               id="description-poste"
-              placeholder="Ex. Le poste consiste à concevoir, développer et maintenir des applications web performantes, collaborer avec l’équipe produit et garantir la qualité technique des livrables."
+              placeholder="Ex. Décrivez les missions, les responsabilités, le périmètre (équipe, clients, outils), les objectifs du poste et les conditions particulières (déplacements, horaires, etc.)."
               className="min-h-[220px]"
               value={descriptionPostes}
               onChange={(e) => setDescriptionPostes(e.target.value)}
@@ -435,7 +522,7 @@ const NewOfferInner = () => {
           >
             Annuler
           </Button>
-          <Button type="submit" disabled={isSubmitting}>
+          <Button type="submit" disabled={isSubmitting || !subscriptionLoaded || !canCreateOffer}>
             {isSubmitting ? "Publication…" : "Publier l’offre"}
           </Button>
         </div>

@@ -1,5 +1,6 @@
 import { Link, useLocation } from "react-router-dom";
 import { useEffect } from "react";
+import { BrandLogo } from "@/components/BrandLogo";
 import "../styles/not-found.css";
 
 const NotFound = () => {
@@ -12,7 +13,9 @@ const NotFound = () => {
   return (
     <div className="legacy-test-not-found">
       <div className="legacy-test-not-found__card">
-        <div className="legacy-test-not-found__eyebrow">DigitRec</div>
+        <div className="legacy-test-not-found__eyebrow">
+          <BrandLogo variant="light" size="sm" />
+        </div>
         <h1 className="legacy-test-not-found__code">404</h1>
         <h2 className="legacy-test-not-found__title">Cette page n&apos;existe pas.</h2>
         <p className="legacy-test-not-found__subtitle">

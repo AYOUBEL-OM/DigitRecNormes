@@ -17,8 +17,15 @@ class Entreprise(Base):
     nom = Column(String(255), nullable=False)
     description = Column(Text, nullable=True)
 
+    stripe_customer_id = Column(String(255), nullable=True, unique=True, index=True)
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     # Relation avec Offre
     offres = relationship("Offre", back_populates="entreprise", cascade="all, delete-orphan")
+    subscriptions = relationship(
+        "Subscription",
+        back_populates="entreprise",
+        cascade="all, delete-orphan",
+    )

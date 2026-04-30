@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from typing import Optional
 from datetime import datetime
 from uuid import UUID
@@ -46,6 +46,8 @@ class OffreUpdate(BaseModel):
 
 
 class OffreResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: UUID
     title: Optional[str] = None
     profile: Optional[str] = None
@@ -63,9 +65,15 @@ class OffreResponse(BaseModel):
     status: Optional[str] = None
     token_liens: Optional[str] = None
 
-    class Config:
-        from_attributes = True
-
 
 class OffreResponseAvecLien(OffreResponse):
     lien_candidature: str
+
+
+class OffreEntrepriseResponse(OffreResponse):
+    """Liste / détail entreprise : lien public, création, état d’accès candidat."""
+
+    created_at: Optional[datetime] = None
+    lien_candidature: str = ""
+    lien_public_actif: bool = False
+    affichage_statut: str = "active"

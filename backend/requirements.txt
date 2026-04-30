@@ -13,3 +13,5 @@ python-multipart==0.0.9
 python-dotenv==1.0.1
 PyMuPDF==1.24.10
 groq
+reportlab>=4.0.0
+stripe>=10.12.0

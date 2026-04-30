@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { useLoadingBar } from "../components/LoadingBarProvider";
+import { getAccessToken, getStoredUser } from "@/services/authService";
 
 export type AccountType = "candidate" | "company" | "unknown";
 
@@ -7,6 +8,10 @@ export type AuthUser = {
   email?: string;
   id: string;
   type?: string;
+  /** Métadonnées optionnelles (ex. JWT / session) si présentes dans le stockage. */
+  last_sign_in_at?: string | null;
+  created_at?: string | null;
+  email_confirmed_at?: string | null;
 };
 
 export type Account = {
@@ -37,12 +42,19 @@ export function useAccount() {
     const loadAccount = () => {
       const stopLoading = startLoading();
       try {
-        const token = localStorage.getItem("access_token");
-        const userJson = localStorage.getItem("user");
+        // Priorité affichage : entreprise si session active, sinon candidat.
+        const entrepriseToken = getAccessToken("entreprise");
+        const candidatToken = getAccessToken("candidat");
+        const entrepriseUser = getStoredUser("entreprise");
+        const candidatUser = getStoredUser("candidat");
 
         if (!active) return;
 
-        if (!token || !userJson) {
+        const hasEntrepriseSession = !!entrepriseToken && !!entrepriseUser;
+        const hasCandidatSession = !!candidatToken && !!candidatUser;
+        const selectedUser = hasEntrepriseSession ? entrepriseUser : hasCandidatSession ? candidatUser : null;
+
+        if (!selectedUser) {
           setState({
             account: null,
             error: "Pas de session valide",
@@ -51,17 +63,7 @@ export function useAccount() {
           return;
         }
 
-        let parsedUser: any;
-        try {
-          parsedUser = JSON.parse(userJson);
-        } catch {
-          setState({
-            account: null,
-            error: "Impossible d'analyser l'utilisateur",
-            loading: false,
-          });
-          return;
-        }
+        const parsedUser: any = selectedUser;
 
         const accountType: AccountType =
           parsedUser.type === "candidat" ? "candidate" : parsedUser.type === "entreprise" ? "company" : "unknown";
@@ -72,6 +74,9 @@ export function useAccount() {
             id: String(parsedUser.id || ""),
             email: parsedUser.email || parsedUser.email_prof || "",
             type: parsedUser.type,
+            last_sign_in_at: parsedUser.last_sign_in_at ?? null,
+            created_at: parsedUser.created_at ?? null,
+            email_confirmed_at: parsedUser.email_confirmed_at ?? null,
           },
           displayName: (parsedUser.nom || parsedUser.prenom || parsedUser.email || "Compte DigitRec") as string,
           profile: null,

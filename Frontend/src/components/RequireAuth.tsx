@@ -1,6 +1,6 @@
 import { ReactNode, useCallback, useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { getSession } from "../services/authService";
+import { getAccessToken, getSession } from "../services/authService";
 import { useLoadingBar } from "./LoadingBarProvider";
 
 type RequireAuthProps = {
@@ -13,7 +13,7 @@ const RequireAuth = ({ children }: RequireAuthProps) => {
   const { startLoading } = useLoadingBar();
 
   const redirectIfNoToken = useCallback(() => {
-    const token = localStorage.getItem("access_token");
+    const token = getAccessToken("entreprise");
     if (!token) {
       navigate("/login", { replace: true });
       return false;
@@ -27,7 +27,7 @@ const RequireAuth = ({ children }: RequireAuthProps) => {
 
     const checkSession = async () => {
       try {
-        const sessionResult = await getSession();
+        const sessionResult = await getSession("entreprise");
 
         if (!active) return;
 
@@ -63,7 +63,7 @@ const RequireAuth = ({ children }: RequireAuthProps) => {
     };
 
     const onStorage = (event: StorageEvent) => {
-      if (event.key === "access_token" && !event.newValue) {
+      if (event.key === "entreprise_access_token" && !event.newValue) {
         navigate("/login", { replace: true });
       }
     };

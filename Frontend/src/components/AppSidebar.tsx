@@ -1,12 +1,13 @@
 import {
   Briefcase,
   ClipboardList,
-  FlaskConical,
+  CreditCard,
   LayoutDashboard,
   Settings,
   UserRound,
   Users,
 } from "lucide-react";
+import { BrandLogo } from "@/components/BrandLogo";
 import { NavLink } from "@/components/NavLink";
 import { useLocation } from "react-router-dom";
 import { useMemo } from "react";
@@ -37,6 +38,7 @@ type NavItem = {
 const companyItems: NavItem[] = [
   { title: "Mes Offres", url: "/dashboard/offers", icon: Briefcase },
   { title: "Candidats", url: "/dashboard/candidates", icon: Users },
+  { title: "Tarifs", url: "/dashboard/pricing", icon: CreditCard },
   { title: "Paramètres", url: "/dashboard/settings", icon: Settings },
 ];
 
@@ -71,14 +73,14 @@ export function AppSidebar() {
   return (
     <Sidebar collapsible="icon">
       <SidebarContent>
-        <div className="flex h-14 items-center px-4">
-          {!collapsed && (
-            <div className="flex items-center gap-2">
-              <Briefcase className="h-5 w-5 text-sidebar-primary" />
-              <span className="text-sm font-bold text-sidebar-foreground">DigitRec</span>
-            </div>
-          )}
-          {collapsed ? <Briefcase className="mx-auto h-5 w-5 text-sidebar-primary" /> : null}
+        <div className="flex items-center justify-center pt-4 pb-4">
+          <BrandLogo
+            variant="dark"
+            collapsed={collapsed}
+            size="xl"
+            compact
+            className="w-full justify-center"
+          />
         </div>
         <SidebarGroup>
           <SidebarGroupLabel>Navigation</SidebarGroupLabel>

@@ -1,19 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useParams } from "react-router-dom";
+import { useNavigate, useParams } from "react-router-dom";
 import axios from "axios";
 import Editor from "@monaco-editor/react";
 import confetti from "canvas-confetti";
 import {
   AlertCircle,
   BrainCircuit,
+  CheckCircle2,
   ChevronLeft,
   ChevronRight,
   Clock,
   Loader2,
   Lock,
-  RotateCcw,
   Send,
-  Trophy,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -24,7 +23,35 @@ import { Label } from "@/components/ui/label";
 import { api } from "@/services/axios";
 
 import { QuizCard } from "./QuizCard";
+import { normalizeQcmAnswer, qcmAnswersEquivalent } from "./qcmNormalize";
 import type { Question } from "./types";
+
+/** Snapshot versionné persisté côté API pour le rapport entreprise (QCM / exercice). */
+export type WrittenTestDetailSnapshotV1 = {
+  version: 1;
+  quiz_kind: "qcm" | "exercice";
+  offre_title: string;
+  qcm?: {
+    items: Array<{
+      order: number;
+      question_text: string;
+      options: string[];
+      expected_answer: string;
+      candidate_answer: string | null;
+      status: "correct" | "incorrect" | "partial";
+      score_label: string;
+    }>;
+  };
+  exercice?: {
+    title?: string;
+    consigne: string;
+    candidate_submission: string;
+    evaluation_score: number;
+    feedback: string | null;
+    /** True si le score est un artefact (erreur technique), pas une note IA réelle. */
+    evaluation_unavailable?: boolean;
+  };
+};
 
 /** Réponse HTTP : objet JSON ou chaîne JSON (éventuellement dans un bloc markdown). */
 function parseQuizGeneratePayload(data: unknown): Record<string, unknown> {
@@ -93,6 +120,9 @@ type VerifyState = "idle" | "loading" | "ok" | "error";
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+/** Aligné sur `sanitize_exercice_payload_for_candidate` (backend) — ne jamais pré-remplir depuis l’API. */
+const CANDIDATE_EXERCICE_EDITOR_START = "# Saisissez votre réponse ci-dessous.\n";
+
 function isValidOffreUuid(s: string): boolean {
   return UUID_RE.test(s.trim());
 }
@@ -118,6 +148,7 @@ function formatCountdown(totalSec: number): string {
 }
 
 export function QuizModule({ offreId: offreIdProp }: QuizModuleProps) {
+  const navigate = useNavigate();
   const params = useParams<{ offreId?: string; id?: string }>();
   const offreId = useMemo(
     () => resolveOffreId(offreIdProp, params as Record<string, string | undefined>),
@@ -131,6 +162,8 @@ export function QuizModule({ offreId: offreIdProp }: QuizModuleProps) {
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /** True si la génération du test a échoué pour cause de service (ex. quota Groq 503), pas une erreur réseau banale. */
+  const [generationUnavailable, setGenerationUnavailable] = useState(false);
 
   const [idCandidature, setIdCandidature] = useState<string | null>(null);
   const [loginEmail, setLoginEmail] = useState("");
@@ -151,12 +184,20 @@ export function QuizModule({ offreId: offreIdProp }: QuizModuleProps) {
   const [currentPage, setCurrentPage] = useState(0);
   const [userCode, setUserCode] = useState("");
   const [score, setScore] = useState<number | null>(null);
-  const [evaluation, setEvaluation] = useState<{ score?: number; feedback?: string } | null>(null);
+  const [evaluation, setEvaluation] = useState<{
+    score?: number | null;
+    feedback?: string;
+    /** Erreur technique / 503 — ne pas afficher comme un score réel. */
+    unavailable?: boolean;
+  } | null>(null);
 
   const [deadline, setDeadline] = useState<number | null>(null);
   const [tick, setTick] = useState(0);
   const timerExpireFired = useRef(false);
   const runTimerExpiry = useRef<() => Promise<void>>(async () => {});
+
+  /** Après soumission réussie vers l’API (submit-test-result) : même UX que la fin d’entretien oral. */
+  const [isWrittenFinished, setIsWrittenFinished] = useState(false);
 
   const testEnded =
     (activeKind === "qcm" && score !== null) ||
@@ -197,22 +238,25 @@ export function QuizModule({ offreId: offreIdProp }: QuizModuleProps) {
   }, [offreId]);
 
   const persistScore = useCallback(
-    async (value: number) => {
+    async (value: number, detail?: WrittenTestDetailSnapshotV1 | null): Promise<boolean> => {
       if (!idCandidature) {
         toast.error("Session invalide", { description: "Identifiant de candidature manquant." });
-        return;
+        return false;
       }
       try {
         await api.post("/api/quiz/submit-test-result", {
           id_candidature: idCandidature,
           score_ecrit: value,
+          ...(detail ? { detail_snapshot: detail } : {}),
         });
         toast.success("Résultat enregistré");
+        return true;
       } catch (e) {
         const msg = axios.isAxiosError(e) ? formatApiDetail(e.response?.data?.detail) : "";
         toast.error("Enregistrement du résultat impossible", {
           description: msg || "Vérifiez votre connexion ou réessayez plus tard.",
         });
+        return false;
       }
     },
     [idCandidature],
@@ -230,6 +274,7 @@ export function QuizModule({ offreId: offreIdProp }: QuizModuleProps) {
     setError(null);
     setScore(null);
     setEvaluation(null);
+    setIsWrittenFinished(false);
     setDeadline(null);
     timerExpireFired.current = false;
 
@@ -246,9 +291,9 @@ export function QuizModule({ offreId: offreIdProp }: QuizModuleProps) {
       setExercice({
         title: String(exData.title ?? "Exercice technique"),
         description: String(exData.description ?? ""),
-        initial_code: String(exData.initial_code ?? ""),
+        initial_code: CANDIDATE_EXERCICE_EDITOR_START,
       });
-      setUserCode(String(exData.initial_code ?? ""));
+      setUserCode(CANDIDATE_EXERCICE_EDITOR_START);
     }
   }, []);
 
@@ -257,17 +302,34 @@ export function QuizModule({ offreId: offreIdProp }: QuizModuleProps) {
 
     setLoading(true);
     setError(null);
+    setGenerationUnavailable(false);
     try {
       const { data } = await api.get(`/api/generate/${offreId}`);
       const payload = parseQuizGeneratePayload(data);
       applyGeneratePayload(payload);
     } catch (e) {
-      const msg =
-        e instanceof Error
+      if (axios.isAxiosError(e) && e.response?.status === 503) {
+        const body = e.response.data as { message?: string; error?: string };
+        const friendly =
+          typeof body?.message === "string" && body.message.trim()
+            ? body.message.trim()
+            : "Le test n'est pas disponible pour le moment. Réessayez plus tard.";
+        setGenerationUnavailable(true);
+        setError(friendly);
+        toast.error("Service temporairement indisponible", { description: friendly });
+        return;
+      }
+      const msg = axios.isAxiosError(e)
+        ? formatApiDetail(e.response?.data?.detail) ||
+          (typeof e.response?.data === "object" &&
+          e.response?.data &&
+          "message" in e.response.data
+            ? String((e.response.data as { message?: string }).message)
+            : "")
+        : e instanceof Error
           ? e.message
-          : axios.isAxiosError(e)
-            ? formatApiDetail(e.response?.data?.detail)
-            : "";
+          : "";
+      setGenerationUnavailable(false);
       setError("Erreur de génération. Vérifiez la connexion au backend.");
       toast.error("Génération impossible", {
         description: msg || "Vérifiez la connexion au serveur.",
@@ -332,18 +394,61 @@ export function QuizModule({ offreId: offreIdProp }: QuizModuleProps) {
   const finalizeQcmCore = useCallback(async () => {
     let correct = 0;
     questions.forEach((q, idx) => {
-      if (userAnswers[idx] === q.answer) correct++;
+      if (qcmAnswersEquivalent(userAnswers[idx], q.answer, q.options)) correct++;
     });
     const finalScore = questions.length ? Math.round((correct / questions.length) * 100) : 0;
-    setScore(finalScore);
-    if (finalScore >= 70) confetti();
-    await persistScore(finalScore);
-  }, [questions, userAnswers, persistScore]);
+    const offTitle = offreConfig?.title?.trim() || "—";
+    const detail: WrittenTestDetailSnapshotV1 | null =
+      questions.length > 0
+        ? {
+            version: 1,
+            quiz_kind: "qcm",
+            offre_title: offTitle,
+            qcm: {
+              items: questions.map((q, idx) => {
+                const ua = userAnswers[idx] ?? "";
+                const expected = q.answer;
+                const ok = qcmAnswersEquivalent(ua, expected, q.options);
+                if (import.meta.env.DEV) {
+                  console.log("QCM CORRECTION DEBUG", {
+                    question: q.question?.slice(0, 200),
+                    candidate_raw: ua,
+                    correct_raw: expected,
+                    candidate_normalized: normalizeQcmAnswer(ua, q.options),
+                    correct_normalized: normalizeQcmAnswer(expected, q.options),
+                    is_correct: ok,
+                  });
+                }
+                return {
+                  order: idx,
+                  question_text: q.question,
+                  options: q.options,
+                  expected_answer: expected,
+                  candidate_answer: ua.trim() ? ua : null,
+                  status: ok ? "correct" : "incorrect",
+                  score_label: ok ? "1 pt" : "0 pt",
+                };
+              }),
+            },
+          }
+        : null;
+    const saved = await persistScore(finalScore, detail);
+    if (saved) {
+      setScore(finalScore);
+      if (finalScore >= 70) confetti();
+      setIsWrittenFinished(true);
+    }
+  }, [questions, userAnswers, persistScore, offreConfig?.title]);
 
   const finalizeExerciceForTimer = useCallback(async () => {
     if (!exercice?.description) {
-      setEvaluation({ score: 0, feedback: "Temps écoulé sans envoi de code." });
-      await persistScore(0);
+      setEvaluation({
+        score: null,
+        unavailable: true,
+        feedback: "Temps écoulé sans réponse transmise — aucune note automatique.",
+      });
+      const saved = await persistScore(0, null);
+      if (saved) setIsWrittenFinished(true);
       return;
     }
     setLoading(true);
@@ -351,21 +456,70 @@ export function QuizModule({ offreId: offreIdProp }: QuizModuleProps) {
       const { data } = await api.post("/api/evaluate", {
         code: userCode,
         consigne: exercice.description,
+        offre_id: offreId,
       });
       const result = typeof data === "string" ? JSON.parse(data) : data;
-      setEvaluation(result);
-      if ((result.score ?? 0) >= 70) confetti();
-      await persistScore(result.score ?? 0);
-    } catch {
-      toast.error("Évaluation automatique impossible", {
-        description: "Le temps est écoulé ; enregistrement avec score 0.",
+      const sc = typeof result.score === "number" ? result.score : Number(result.score);
+      setEvaluation({
+        score: Number.isFinite(sc) ? sc : null,
+        feedback: result.feedback != null ? String(result.feedback) : undefined,
+        unavailable: false,
       });
-      setEvaluation({ score: 0, feedback: "Erreur d’évaluation." });
-      await persistScore(0);
+      const offTitle = offreConfig?.title?.trim() || "—";
+      const detail: WrittenTestDetailSnapshotV1 = {
+        version: 1,
+        quiz_kind: "exercice",
+        offre_title: offTitle,
+        exercice: {
+          title: exercice.title,
+          consigne: exercice.description,
+          candidate_submission: userCode,
+          evaluation_score: Number(result.score ?? 0),
+          feedback: result.feedback != null ? String(result.feedback) : null,
+        },
+      };
+      const saved = await persistScore(result.score ?? 0, detail);
+      if (saved) {
+        if ((result.score ?? 0) >= 70) confetti();
+        setIsWrittenFinished(true);
+      }
+    } catch (e) {
+      const offTitle = offreConfig?.title?.trim() || "—";
+      const is503 = axios.isAxiosError(e) && e.response?.status === 503;
+      const apiMsg = is503 ? formatApiDetail(e.response?.data?.detail) : "";
+      toast.error("Évaluation automatique impossible", {
+        description: is503
+          ? apiMsg ||
+            "Service saturé ou indisponible. La session est enregistrée sans note automatique — ce n’est pas un zéro lié à votre copie."
+          : "Le temps est écoulé. La session est enregistrée sans note automatique fiable — ce n’est pas un zéro lié à votre copie.",
+      });
+      setEvaluation({
+        score: null,
+        unavailable: true,
+        feedback: is503
+          ? apiMsg ||
+            "Évaluation technique indisponible (service saturé). Aucun score automatique n’a pu être calculé."
+          : "Évaluation technique indisponible. Aucun score automatique n’a pu être calculé (fin de temps ou service momentanément indisponible).",
+      });
+      const saved = await persistScore(0, {
+        version: 1,
+        quiz_kind: "exercice",
+        offre_title: offTitle,
+        exercice: {
+          title: exercice?.title,
+          consigne: exercice?.description ?? "",
+          candidate_submission: userCode,
+          evaluation_score: 0,
+          feedback:
+            "Évaluation automatique impossible en fin de session (service indisponible ou erreur réseau).",
+          evaluation_unavailable: true,
+        },
+      });
+      if (saved) setIsWrittenFinished(true);
     } finally {
       setLoading(false);
     }
-  }, [exercice, userCode, persistScore]);
+  }, [exercice, userCode, persistScore, offreConfig?.title, offreId]);
 
   runTimerExpiry.current = async () => {
     toast.warning("Temps écoulé", {
@@ -442,12 +596,50 @@ export function QuizModule({ offreId: offreIdProp }: QuizModuleProps) {
       const { data } = await api.post("/api/evaluate", {
         code: userCode,
         consigne: exercice.description,
+        offre_id: offreId,
       });
       const result = typeof data === "string" ? JSON.parse(data) : data;
-      setEvaluation(result);
-      if ((result.score ?? 0) >= 70) confetti();
-      await persistScore(result.score ?? 0);
+      const sc = typeof result.score === "number" ? result.score : Number(result.score);
+      setEvaluation({
+        score: Number.isFinite(sc) ? sc : null,
+        feedback: result.feedback != null ? String(result.feedback) : undefined,
+        unavailable: false,
+      });
+      const offTitle = offreConfig?.title?.trim() || "—";
+      const detail: WrittenTestDetailSnapshotV1 = {
+        version: 1,
+        quiz_kind: "exercice",
+        offre_title: offTitle,
+        exercice: {
+          title: exercice.title,
+          consigne: exercice.description,
+          candidate_submission: userCode,
+          evaluation_score: Number(result.score ?? 0),
+          feedback: result.feedback != null ? String(result.feedback) : null,
+        },
+      };
+      const saved = await persistScore(result.score ?? 0, detail);
+      if (saved) {
+        if ((result.score ?? 0) >= 70) confetti();
+        setIsWrittenFinished(true);
+      }
     } catch (e) {
+      if (axios.isAxiosError(e) && e.response?.status === 503) {
+        const msg = formatApiDetail(e.response?.data?.detail);
+        setEvaluation({
+          score: null,
+          unavailable: true,
+          feedback:
+            msg ||
+            "Évaluation technique temporairement indisponible. Aucun score automatique n’a été attribué.",
+        });
+        toast.error("Service temporairement indisponible", {
+          description:
+            msg ||
+            "Réessayez dans quelques instants. Votre copie n’est pas notée 0 % pour cette raison.",
+        });
+        return;
+      }
       const msg = axios.isAxiosError(e) ? formatApiDetail(e.response?.data?.detail) : "";
       setError("Erreur lors de l’évaluation.");
       toast.error("Évaluation impossible", { description: msg || "Réessayez ou contactez le support." });
@@ -467,6 +659,38 @@ export function QuizModule({ offreId: offreIdProp }: QuizModuleProps) {
           <AlertCircle className="mx-auto mb-4 h-12 w-12 text-destructive" />
           <h1 className="text-xl font-semibold">Lien invalide ou expiré</h1>
           <p className="mt-3 text-muted-foreground text-sm">Contactez l’équipe de recrutement.</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (isWrittenFinished) {
+    return (
+      <div className="flex min-h-screen flex-col items-center justify-center bg-gradient-to-br from-background to-primary/5 p-6 text-center">
+        <div className="w-full max-w-lg rounded-xl border border-primary/20 bg-card p-8 shadow-lg shadow-primary/10 card-shadow">
+          <div className="mx-auto mb-6 flex h-14 w-14 items-center justify-center rounded-full bg-success/15 text-success">
+            <CheckCircle2 className="h-8 w-8" aria-hidden />
+          </div>
+          <h1 className="text-2xl font-bold tracking-tight text-primary">Merci pour votre participation.</h1>
+          <p className="mt-4 text-sm leading-relaxed text-foreground">
+            Vos réponses ont été enregistrées.
+          </p>
+          <p className="mt-2 text-xs text-muted-foreground">
+            Vous pouvez fermer cette page : l&apos;analyse détaillée se poursuit côté serveur.
+          </p>
+          <Button
+            type="button"
+            className="mt-8 w-full max-w-xs"
+            onClick={() => {
+              window.close();
+              navigate("/", { replace: true });
+            }}
+          >
+            Fermer la page
+          </Button>
+          <p className="mt-4 text-xs text-muted-foreground">
+            Si la fenêtre ne se ferme pas, vous pouvez fermer cet onglet ou quitter le navigateur.
+          </p>
         </div>
       </div>
     );
@@ -547,7 +771,14 @@ export function QuizModule({ offreId: offreIdProp }: QuizModuleProps) {
         )}
 
         {error && (
-          <div className="mx-auto mb-6 flex max-w-3xl items-center gap-3 rounded-xl border border-destructive/20 bg-destructive/10 p-4 text-destructive">
+          <div
+            className={
+              generationUnavailable
+                ? "mx-auto mb-6 flex max-w-3xl items-center gap-3 rounded-xl border border-amber-500/40 bg-amber-500/10 p-4 text-amber-950 dark:text-amber-100"
+                : "mx-auto mb-6 flex max-w-3xl items-center gap-3 rounded-xl border border-destructive/20 bg-destructive/10 p-4 text-destructive"
+            }
+            role="alert"
+          >
             <AlertCircle className="h-5 w-5 shrink-0" />
             <span className="text-sm font-medium">{error}</span>
           </div>
@@ -603,18 +834,6 @@ export function QuizModule({ offreId: offreIdProp }: QuizModuleProps) {
           </div>
         )}
 
-        {/* --- SECTION RESULTAT QCM --- */}
-        {score !== null && activeKind === "qcm" && (
-          <div className="mx-auto max-w-md rounded-3xl border-4 border-primary bg-card p-10 text-center shadow-2xl">
-            <Trophy className="mx-auto mb-4 h-16 w-16 text-yellow-500" />
-            <h2 className="text-2xl font-bold">Votre score</h2>
-            <div className="my-4 text-7xl font-black text-primary">{score}%</div>
-            <Button variant="ghost" className="mt-4 gap-2" onClick={() => window.location.reload()}>
-              <RotateCcw className="h-4 w-4" /> Recommencer
-            </Button>
-          </div>
-        )}
-
         {/* --- SECTION EXERCICE --- */}
         {activeKind === "exercice" && exercice && (
           <div className="grid min-h-[500px] grid-cols-1 gap-8 lg:grid-cols-2">
@@ -626,11 +845,29 @@ export function QuizModule({ offreId: offreIdProp }: QuizModuleProps) {
               </div>
               {evaluation && (
                 <div className="mt-8 rounded-2xl bg-primary p-6 text-primary-foreground">
-                  <div className="mb-2 flex items-center justify-between">
-                    <span className="font-bold">Score IA</span>
-                    <span className="text-3xl font-black">{evaluation.score}%</span>
-                  </div>
-                  <p className="text-sm opacity-90">{evaluation.feedback}</p>
+                  {evaluation.unavailable ? (
+                    <>
+                      <div className="mb-2 font-bold">Évaluation</div>
+                      <p className="text-sm leading-relaxed opacity-95">
+                        {evaluation.feedback ??
+                          "Évaluation technique indisponible. Ce n’est pas une note à 0 % liée à votre copie."}
+                      </p>
+                    </>
+                  ) : (
+                    <>
+                      <div className="mb-2 flex items-center justify-between">
+                        <span className="font-bold">Score IA</span>
+                        <span className="text-3xl font-black">
+                          {evaluation.score != null && Number.isFinite(evaluation.score)
+                            ? `${Math.round(evaluation.score)} %`
+                            : "—"}
+                        </span>
+                      </div>
+                      {evaluation.feedback ? (
+                        <p className="text-sm opacity-90">{evaluation.feedback}</p>
+                      ) : null}
+                    </>
+                  )}
                 </div>
               )}
             </div>
@@ -642,7 +879,7 @@ export function QuizModule({ offreId: offreIdProp }: QuizModuleProps) {
                   <div className="h-3 w-3 rounded-full bg-yellow-500" />
                   <div className="h-3 w-3 rounded-full bg-green-500" />
                 </div>
-                <span className="ml-4 font-mono text-xs text-gray-400">solution.py</span>
+                <span className="ml-4 font-mono text-xs text-gray-400">reponse.py</span>
               </div>
               <div className="min-h-[400px] flex-1">
                 <Editor

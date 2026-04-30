@@ -1,5 +1,6 @@
 import { motion } from "framer-motion";
 import { ReactNode, useEffect, useState } from "react";
+import { BrandLogo } from "@/components/BrandLogo";
 import "../styles/auth.css";
 
 type AuthShellProps = {
@@ -70,39 +71,43 @@ const AuthShell = ({
             <div className="legacy-auth-hero__glow legacy-auth-hero__glow--one" />
             <div className="legacy-auth-hero__glow legacy-auth-hero__glow--two" />
 
-          <div className="legacy-auth-hero__brand">
-            <div className="legacy-auth-hero__mark">DR</div>
-            <div>
-              <div className="legacy-auth-hero__brand-title">DigitRec</div>
-              <div className="legacy-auth-hero__brand-subtitle">Plateforme de recrutement</div>
-            </div>
-          </div>
-
-            <div className="legacy-auth-hero__content">
-              <p className="legacy-auth-hero__eyebrow">{eyebrow}</p>
-              <h1 className={titleClassName ? `legacy-auth-hero__title ${titleClassName}` : "legacy-auth-hero__title"}>
-                <span className="legacy-auth-hero__title-text">{typedTitle}</span>
-                <span className="legacy-auth-hero__cursor" aria-hidden="true" />
-              </h1>
-              <p className="legacy-auth-hero__subtitle">{subtitle}</p>
-
-              <div className="legacy-auth-hero__list">
-                {highlights.map((item) => (
-                  <div key={item} className="legacy-auth-hero__bullet">
-                    <span className="legacy-auth-hero__bullet-dot" />
-                    <span>{item}</span>
+            <div className="flex flex-col justify-center h-full px-10 space-y-4">
+              <div className="max-w-md mx-auto flex flex-col justify-center h-full">
+                <div className="flex justify-center mb-1 overflow-visible">
+                  <div className="h-24 flex items-center justify-center overflow-visible">
+                    <BrandLogo variant="dark" size="hero" compact />
                   </div>
-                ))}
-              </div>
-            </div>
-
-            <div className="legacy-auth-hero__stats">
-              {stats.map((stat) => (
-                <div key={stat.label} className="legacy-auth-hero__stat">
-                  <span className="legacy-auth-hero__stat-value">{stat.value}</span>
-                  <span className="legacy-auth-hero__stat-label">{stat.label}</span>
                 </div>
-              ))}
+
+                <div className="legacy-auth-hero__content">
+                  <p className="text-xs tracking-wider text-muted-foreground uppercase">
+                    {eyebrow}
+                  </p>
+                  <h1 className="text-4xl font-bold leading-tight">
+                    <span className="legacy-auth-hero__title-text">{typedTitle}</span>
+                    <span className="legacy-auth-hero__cursor" aria-hidden="true" />
+                  </h1>
+                  <p className="text-sm text-muted-foreground">{subtitle}</p>
+
+                  <div className="legacy-auth-hero__list">
+                    {highlights.map((item) => (
+                      <div key={item} className="legacy-auth-hero__bullet">
+                        <span className="legacy-auth-hero__bullet-dot" />
+                        <span>{item}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="legacy-auth-hero__stats">
+                  {stats.map((stat) => (
+                    <div key={stat.label} className="legacy-auth-hero__stat">
+                      <span className="legacy-auth-hero__stat-value">{stat.value}</span>
+                      <span className="legacy-auth-hero__stat-label">{stat.label}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
             </div>
           </motion.section>
         ) : null}
