@@ -134,6 +134,12 @@ const LoginCompany = () => {
           />
         </div>
 
+        <div className="flex justify-end">
+          <Link className="legacy-auth-link text-sm" to="/forgot-password">
+            Mot de passe oublié ?
+          </Link>
+        </div>
+
         <button className="legacy-auth-submit" type="submit" disabled={loading}>
           {loading ? "Connexion..." : "Se connecter"}
         </button>

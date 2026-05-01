@@ -18,6 +18,10 @@ from app.models.candidat import Candidat
 from app.models.candidature import Candidature, StatutCandidature
 from app.models.offre import Offre
 from app.services.email_service import send_acceptance_email, send_rejection_email
+from app.services.subscription_access import (
+    ensure_default_trial_subscription,
+    entreprise_allows_ai,
+)
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -113,6 +117,22 @@ def run_cv_filtering_for_candidature(candidature_id: Any, offre_id: Any, cv_abs_
     """
     db = SessionLocal()
     try:
+        offre_row = db.query(Offre).filter(Offre.id == offre_id).first()
+        if not offre_row or not offre_row.entreprise_id:
+            logger.info(
+                "Filtrage CV par IA ignoré (offre %s : entreprise introuvable).",
+                offre_id,
+            )
+            return
+
+        ensure_default_trial_subscription(db, offre_row.entreprise_id)
+        if not entreprise_allows_ai(db, offre_row.entreprise_id):
+            logger.info(
+                "Filtrage CV par IA ignoré (offre %s : pas d’abonnement actif).",
+                offre_id,
+            )
+            return
+
         cv_text = _extract_text_from_pdf(cv_abs_path)
         requirements = _build_job_context(db, offre_id)
         ai_result = analyze_cv_with_groq(cv_text=cv_text, requirements=requirements)
@@ -151,12 +171,15 @@ def run_cv_filtering_for_candidature(candidature_id: Any, offre_id: Any, cv_abs_
             candidat_email = candidat.email
 
         if candidat_email:
+            offre_mail = db.query(Offre).filter(Offre.id == UUID(str(offre_id))).first()
+            offre_date_fin = offre_mail.date_fin_offres if offre_mail else None
             if candidature.statut == StatutCandidature.acceptee:
                 send_acceptance_email(
                     candidat_email=candidat_email,
                     candidat_name=candidat_name,
                     job_title=job_title,
                     offre_id=UUID(str(offre_id)),
+                    offre_date_fin=offre_date_fin,
                 )
             elif candidature.statut == StatutCandidature.refusee:
                 send_rejection_email(

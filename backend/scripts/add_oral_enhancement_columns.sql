@@ -1,0 +1,12 @@
+-- ---------------------------------------------------------------------------
+-- Ce dépôt cible le schéma PostgreSQL SANS colonnes d’extension sur
+-- oral_test_questions / tests_oraux (voir modèles SQLAlchemy alignés).
+--
+-- Les métadonnées enrichies (langue, scores détaillés, etc.) sont stockées
+-- dans tests_oraux.cheating_flags JSONB (clés answer_insights, session_scores).
+--
+-- N’exécutez PAS ce fichier sur une base déjà conforme au schéma minimal :
+-- il n’est conservé que comme référence historique / option future explicite.
+-- ---------------------------------------------------------------------------
+
+-- (vide intentionnellement — pas de migration requise pour le schéma actuel.)

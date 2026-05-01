@@ -63,7 +63,7 @@ except psycopg2.OperationalError as e:
     elif "timeout" in err_str or "connection refused" in err_str:
         print("\n💡 FIX: Network issue!")
         print("   - Check internet connection")
-        print("   - Try pinging: db.rhedlvxkmbugidditvow.supabase.co")
+        print("   - Try pinging l’hôte `db.<ref>.supabase.co` depuis votre DATABASE_URL")
         
 except Exception as e:
     print(f"❌ Unexpected error: {type(e).__name__}: {e}")

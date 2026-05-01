@@ -84,9 +84,13 @@ const RegisterCandidate = () => {
         setTitle((prev) => prev || data.title || "");
         setProfile((prev) => prev || data.profile || "");
         setLevel((prev) => prev || data.level || "");
-      } catch {
+      } catch (e) {
         if (!active) return;
-        setMessage("Impossible de charger les informations de l’offre.");
+        const msg =
+          e instanceof Error
+            ? e.message
+            : "Impossible de charger les informations de l’offre.";
+        setMessage(msg);
       } finally {
         if (active) setPageLoading(false);
         stopLoading();
@@ -187,11 +191,14 @@ const RegisterCandidate = () => {
           email: email.trim(),
           mot_de_passe: password,
         }),
+        auth: "none",
       });
 
+      // Session candidat séparée (ne doit pas écraser l'entreprise)
       const accessToken = loginData.access_token;
-      localStorage.setItem("access_token", accessToken);
-      localStorage.setItem("user", JSON.stringify(loginData.user));
+      localStorage.setItem("candidat_access_token", accessToken);
+      localStorage.setItem("candidat_user", JSON.stringify(loginData.user));
+      window.dispatchEvent(new Event("digitrec:session-update"));
 
       const candidatureForm = new FormData();
       candidatureForm.append("cv", cvFile);
@@ -199,6 +206,7 @@ const RegisterCandidate = () => {
       await apiFetch(`/api/candidatures/offre/${token}`, {
         method: "POST",
         body: candidatureForm,
+        auth: "candidat",
       });
 
       try {

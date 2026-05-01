@@ -30,13 +30,17 @@ import {
   type OffreEntrepriseItem,
   type CandidatureDetailsResponse,
 } from "@/services/authService";
-import { ExternalLink, Search } from "lucide-react";
+import { BookOpen, ExternalLink, FileText, Mail, Search } from "lucide-react";
+import CandidateEmailDialog from "@/components/entreprise/CandidateEmailDialog";
+import OralReportDialog from "@/oral-interview/components/OralReportDialog";
+import WrittenReportDialog from "@/components/Quiz/WrittenReportDialog";
 
 const STATUT_LABELS: Record<string, string> = {
   nouvelle: "En attente",
   en_cours: "En cours",
   acceptee: "Acceptée",
   refusee: "Refusée",
+  a_revoir: "À revoir",
 };
 
 const ALL_OFFERS = "__all__";
@@ -47,6 +51,8 @@ function statutBadgeClass(statut: string): string {
       return "border-transparent bg-emerald-500/15 text-emerald-800 dark:text-emerald-300";
     case "refusee":
       return "border-transparent bg-destructive/15 text-destructive";
+    case "a_revoir":
+      return "border-transparent bg-amber-500/15 text-amber-950 dark:text-amber-100";
     case "en_cours":
     case "nouvelle":
     default:
@@ -73,6 +79,14 @@ function scoreToPercent(raw: number | null | undefined): number | null {
 function listCvPercent(scoreIa: number | null): string | null {
   if (scoreIa == null) return null;
   return `${scoreToPercent(scoreIa)}%`;
+}
+
+/** Score affiché en liste : moyenne des épreuves disponibles, sinon repli sur le % CV seul. */
+function listDisplayedPercent(c: EntrepriseCandidatureItem): string | null {
+  if (c.score_final_pct != null && Number.isFinite(Number(c.score_final_pct))) {
+    return `${Math.round(Number(c.score_final_pct))}%`;
+  }
+  return listCvPercent(c.score_ia);
 }
 
 function ScoreBlock({
@@ -118,6 +132,11 @@ const CandidatesInner = () => {
   const [details, setDetails] = useState<CandidatureDetailsResponse | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState<string | null>(null);
+  const [writtenReportOpen, setWrittenReportOpen] = useState(false);
+  const [oralReportOpen, setOralReportOpen] = useState(false);
+  const [emailDialogOpen, setEmailDialogOpen] = useState(false);
+  /** Cible de portail à l’intérieur du Sheet : les modales imbriquées restent dans l’arbre DOM du Dialog Radix (modal stable, pas de « outside » fantôme). */
+  const [nestedModalHost, setNestedModalHost] = useState<HTMLDivElement | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -178,6 +197,14 @@ const CandidatesInner = () => {
     return () => {
       cancelled = true;
     };
+  }, [detailId]);
+
+  useEffect(() => {
+    if (!detailId) {
+      setWrittenReportOpen(false);
+      setOralReportOpen(false);
+      setEmailDialogOpen(false);
+    }
   }, [detailId]);
 
   const filtered = useMemo(() => {
@@ -301,11 +328,12 @@ const CandidatesInner = () => {
                     {c.offre_titre || "—"}
                   </p>
                 </div>
-                <Badge className={statutBadgeClass(c.statut)}>
-                  {STATUT_LABELS[c.statut] ?? c.statut}
+                <Badge className={statutBadgeClass(c.statut_synthese ?? c.statut)}>
+                  {STATUT_LABELS[c.statut_synthese ?? c.statut] ??
+                    (c.statut_synthese ?? c.statut)}
                 </Badge>
                 <div className="shrink-0 text-sm font-medium tabular-nums text-foreground">
-                  {listCvPercent(c.score_ia) ?? "—"}
+                  {listDisplayedPercent(c) ?? "—"}
                 </div>
               </button>
             ))}
@@ -315,6 +343,9 @@ const CandidatesInner = () => {
         open={!!detailId}
         onOpenChange={(open) => {
           if (!open) {
+            setWrittenReportOpen(false);
+            setOralReportOpen(false);
+            setEmailDialogOpen(false);
             setDetailId(null);
             setPeekName(null);
           }
@@ -323,6 +354,37 @@ const CandidatesInner = () => {
         <SheetContent
           side="right"
           className="flex w-full flex-col overflow-y-auto sm:max-w-lg"
+          onPointerDownOutside={(e) => {
+            if (writtenReportOpen || oralReportOpen || emailDialogOpen) {
+              e.preventDefault();
+            }
+          }}
+          onFocusOutside={(e) => {
+            if (writtenReportOpen || oralReportOpen || emailDialogOpen) {
+              e.preventDefault();
+            }
+          }}
+          onInteractOutside={(e) => {
+            if (writtenReportOpen || oralReportOpen || emailDialogOpen) {
+              e.preventDefault();
+            }
+          }}
+          onEscapeKeyDown={(e) => {
+            if (writtenReportOpen) {
+              e.preventDefault();
+              setWrittenReportOpen(false);
+              return;
+            }
+            if (oralReportOpen) {
+              e.preventDefault();
+              setOralReportOpen(false);
+              return;
+            }
+            if (emailDialogOpen) {
+              e.preventDefault();
+              setEmailDialogOpen(false);
+            }
+          }}
         >
             {detailId ? (
               <motion.div
@@ -330,8 +392,13 @@ const CandidatesInner = () => {
                 initial={{ opacity: 0, x: 24 }}
                 animate={{ opacity: 1, x: 0 }}
                 transition={{ duration: 0.25, ease: [0.22, 1, 0.36, 1] }}
-                className="flex flex-1 flex-col gap-6"
+                className="relative flex flex-1 flex-col gap-6"
               >
+                <div
+                  ref={setNestedModalHost}
+                  className="pointer-events-none absolute left-0 top-0 z-[240] h-px w-px overflow-visible"
+                  aria-hidden
+                />
                 <SheetHeader className="text-left">
                   <div className="flex items-start gap-4">
                     <Avatar className="h-14 w-14">
@@ -370,6 +437,24 @@ const CandidatesInner = () => {
                         Scores
                       </h3>
                       <div className="space-y-5">
+                        {details.scores.score_final_percent != null &&
+                        Number.isFinite(details.scores.score_final_percent) ? (
+                          <div className="space-y-2">
+                            <div className="flex items-center justify-between gap-3 text-sm">
+                              <span className="font-medium text-foreground">Score final</span>
+                              <span className="tabular-nums font-semibold text-foreground">
+                                {Math.round(details.scores.score_final_percent)}%
+                              </span>
+                            </div>
+                            <Progress
+                              value={Math.min(
+                                100,
+                                Math.max(0, details.scores.score_final_percent),
+                              )}
+                              className="h-2.5"
+                            />
+                          </div>
+                        ) : null}
                         <ScoreBlock
                           label="Correspondance CV"
                           raw={details.scores.score_cv_matching}
@@ -409,6 +494,57 @@ const CandidatesInner = () => {
                       </p>
                     ) : null}
 
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="lg"
+                      className="w-full gap-2"
+                      disabled={details.scores.score_ecrit == null}
+                      onClick={() => setWrittenReportOpen(true)}
+                    >
+                      Voir le rapport écrit
+                      <BookOpen className="h-4 w-4" />
+                    </Button>
+                    {details.scores.score_ecrit == null ? (
+                      <p className="text-center text-xs text-muted-foreground">
+                        Rapport disponible après passage du test écrit.
+                      </p>
+                    ) : null}
+
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="lg"
+                      className="w-full gap-2"
+                      disabled={details.scores.score_oral == null}
+                      onClick={() => setOralReportOpen(true)}
+                    >
+                      Voir le rapport oral
+                      <FileText className="h-4 w-4" />
+                    </Button>
+                    {details.scores.score_oral == null ? (
+                      <p className="text-center text-xs text-muted-foreground">
+                        Rapport disponible après passage du test oral (score enregistré).
+                      </p>
+                    ) : null}
+
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      size="lg"
+                      className="w-full gap-2"
+                      disabled={!details.candidate.email?.trim()}
+                      onClick={() => setEmailDialogOpen(true)}
+                    >
+                      Envoyer email
+                      <Mail className="h-4 w-4" />
+                    </Button>
+                    {!details.candidate.email?.trim() ? (
+                      <p className="text-center text-xs text-muted-foreground">
+                        Aucune adresse email enregistrée pour ce candidat.
+                      </p>
+                    ) : null}
+
                     <Separator />
 
                     <div className="space-y-3">
@@ -439,9 +575,15 @@ const CandidatesInner = () => {
                         <div className="flex justify-between gap-4">
                           <dt className="text-muted-foreground">Statut</dt>
                           <dd className="text-right">
-                            <Badge className={statutBadgeClass(details.status.statut)}>
-                              {STATUT_LABELS[details.status.statut] ??
-                                details.status.statut}
+                            <Badge
+                              className={statutBadgeClass(
+                                details.status.statut_synthese ?? details.status.statut,
+                              )}
+                            >
+                              {STATUT_LABELS[
+                                details.status.statut_synthese ?? details.status.statut
+                              ] ??
+                                (details.status.statut_synthese ?? details.status.statut)}
                             </Badge>
                           </dd>
                         </div>
@@ -453,6 +595,35 @@ const CandidatesInner = () => {
             ) : null}
         </SheetContent>
       </Sheet>
+
+      {detailId && details ? (
+        <CandidateEmailDialog
+          open={emailDialogOpen}
+          onOpenChange={setEmailDialogOpen}
+          candidatureId={detailId}
+          details={details}
+          portalContainer={nestedModalHost}
+        />
+      ) : null}
+
+      {detailId ? (
+        <>
+          <WrittenReportDialog
+            open={writtenReportOpen}
+            onOpenChange={setWrittenReportOpen}
+            candidatureId={detailId}
+            candidateLabel={detailName || peekName || "Candidat"}
+            portalContainer={nestedModalHost}
+          />
+          <OralReportDialog
+            open={oralReportOpen}
+            onOpenChange={setOralReportOpen}
+            candidatureId={detailId}
+            candidateLabel={detailName || peekName || "Candidat"}
+            portalContainer={nestedModalHost}
+          />
+        </>
+      ) : null}
     </div>
   );
 };

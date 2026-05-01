@@ -1,8 +1,10 @@
 """
 Endpoints entreprise authentifiée (JWT).
 """
+import logging
+import smtplib
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -18,9 +20,16 @@ from app.models.candidat import Candidat
 from app.models.candidature import Candidature, StatutCandidature
 from app.models.entreprise import Entreprise
 from app.models.offre import Offre
-from app.schemas.entreprise import EntrepriseChangePassword, EntrepriseMePatch
+from app.schemas.entreprise import (
+    EntrepriseChangePassword,
+    EntrepriseMePatch,
+    SendCandidateEmailRequest,
+)
+from app.services.email_service import send_email
 from app.models.test_ecrit import TestEcrit
 from app.models.test_oral import TestOral
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/entreprises", tags=["Entreprises"])
 
@@ -75,6 +84,73 @@ def change_password_entreprise(
     return {"message": "Mot de passe mis à jour"}
 
 
+@router.post("/me/send-candidate-email", status_code=status.HTTP_200_OK)
+def send_candidate_email(
+    body: SendCandidateEmailRequest,
+    entreprise: Entreprise = Depends(get_entreprise_from_token),
+    db: Session = Depends(get_db),
+) -> dict:
+    """
+    Envoie un email au candidat : la candidature doit appartenir à une offre de l’entreprise connectée.
+    Le destinataire effectif doit correspondre à l’email du candidat en base (pas d’envoi arbitraire).
+    """
+    row = (
+        db.query(Candidature, Offre, Candidat)
+        .join(Offre, Candidature.offre_id == Offre.id)
+        .join(Candidat, Candidature.candidat_id == Candidat.id)
+        .filter(
+            Candidature.id == body.candidature_id,
+            Offre.entreprise_id == entreprise.id,
+        )
+        .first()
+    )
+    if not row:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Candidature introuvable ou non autorisée.",
+        )
+    _, _, candidat = row
+    cand_email = (candidat.email or "").strip().lower()
+    to_norm = str(body.to).strip().lower()
+    if not cand_email or to_norm != cand_email:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Le destinataire doit être l’adresse email du candidat associé à cette candidature.",
+        )
+
+    settings = get_settings()
+    if not (settings.SMTP_HOST and settings.SMTP_USER and settings.SMTP_PASS):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Envoi d’email indisponible : configuration SMTP incomplète sur le serveur.",
+        )
+
+    subject = body.subject.strip()
+    message = body.message.strip()
+    if not subject or not message:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Le sujet et le message ne peuvent pas être vides.",
+        )
+
+    try:
+        send_email(to_email=cand_email, subject=subject, body=message)
+    except smtplib.SMTPException as e:
+        logger.exception("send_candidate_email SMTP")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Échec d’envoi SMTP : {e!s}",
+        ) from e
+    except OSError as e:
+        logger.exception("send_candidate_email network")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Erreur réseau lors de l’envoi : {e!s}",
+        ) from e
+
+    return {"message": "Email envoyé.", "to": cand_email}
+
+
 def _normalize_score_ia(raw: Any) -> Optional[float]:
     """Mappe score_cv_matching (souvent 0–100) vers une note sur 5."""
     if raw is None:
@@ -86,6 +162,105 @@ def _normalize_score_ia(raw: Any) -> Optional[float]:
     if v <= 5:
         return round(v, 1)
     return round(min(5.0, v / 20.0), 1)
+
+
+def _score_cv_raw_to_percent(raw: Any) -> Optional[float]:
+    """score_cv_matching : 0–5 → %, sinon traité comme déjà 0–100."""
+    if raw is None:
+        return None
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if v <= 5:
+        return round((v / 5.0) * 100.0, 2)
+    return round(min(100.0, v), 2)
+
+
+def _offre_oral_eligible(offre: Offre) -> bool:
+    """Oral inclus dans la moyenne uniquement si l’offre prévoit un oral (nb questions > 0)."""
+    n = offre.nombre_questions_orale
+    if n is None:
+        return False
+    try:
+        return int(n) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def compute_candidate_final_score_percent(
+    score_cv_matching: Any,
+    score_ecrit: Optional[float],
+    score_oral: Optional[float],
+    oral_eligible: bool,
+) -> Optional[float]:
+    """
+    Moyenne des évaluations disponibles uniquement (pas de 0 implicite).
+    Oral exclu si non éligible ou score absent (ex. en attente).
+    """
+    parts: List[float] = []
+    cvp = _score_cv_raw_to_percent(score_cv_matching)
+    if cvp is not None:
+        parts.append(cvp)
+    if score_ecrit is not None:
+        parts.append(float(score_ecrit))
+    if oral_eligible and score_oral is not None:
+        parts.append(float(score_oral))
+    if not parts:
+        return None
+    return round(sum(parts) / len(parts), 1)
+
+
+def synthese_statut_from_final(final_percent: Optional[float]) -> Optional[str]:
+    """Libellés métier pour l’affichage dashboard (ne modifie pas la base)."""
+    if final_percent is None:
+        return None
+    if final_percent >= 80:
+        return "acceptee"
+    if final_percent >= 60:
+        return "a_revoir"
+    return "refusee"
+
+
+def _map_latest_test_ecrit(
+    db: Session, candidature_ids: List[UUID]
+) -> Dict[UUID, TestEcrit]:
+    if not candidature_ids:
+        return {}
+    rows = (
+        db.query(TestEcrit)
+        .filter(TestEcrit.id_candidature.in_(candidature_ids))
+        .all()
+    )
+    best: Dict[UUID, TestEcrit] = {}
+    for t in rows:
+        cid = t.id_candidature
+        cur = best.get(cid)
+        if cur is None or (t.id is not None and cur.id is not None and t.id > cur.id):
+            best[cid] = t
+    return best
+
+
+def _map_latest_test_oral(
+    db: Session, candidature_ids: List[UUID]
+) -> Dict[UUID, TestOral]:
+    if not candidature_ids:
+        return {}
+    bind = db.get_bind()
+    if bind is None or not sa_inspect(bind).has_table("tests_oraux"):
+        return {}
+    rows = (
+        db.query(TestOral)
+        .filter(TestOral.id_candidature.in_(candidature_ids))
+        .all()
+    )
+    best: Dict[UUID, TestOral] = {}
+    for t in rows:
+        cid = t.id_candidature
+        cur = best.get(cid)
+        if cur is None or (t.id is not None and cur.id is not None and t.id > cur.id):
+            best[cid] = t
+    return best
 
 
 def _read_etape_actuelle(db: Session, candidature_id: UUID) -> Optional[str]:
@@ -193,9 +368,29 @@ def lister_mes_candidatures(
         .all()
     )
 
+    cand_ids = [c.id for c, _, _ in rows]
+    ecrit_map = _map_latest_test_ecrit(db, cand_ids)
+    oral_map = _map_latest_test_oral(db, cand_ids)
+
     out: List[dict] = []
     for cand, person, offre in rows:
         nom_complet = f"{person.prenom} {person.nom}".strip()
+        te = ecrit_map.get(cand.id)
+        tor = oral_map.get(cand.id)
+        score_ecrit = float(te.score_ecrit) if te else None
+        score_oral = (
+            float(tor.score_oral_global)
+            if tor is not None and tor.score_oral_global is not None
+            else None
+        )
+        oral_elig = _offre_oral_eligible(offre)
+        score_final_pct = compute_candidate_final_score_percent(
+            cand.score_cv_matching,
+            score_ecrit,
+            score_oral,
+            oral_elig,
+        )
+        statut_synthese = synthese_statut_from_final(score_final_pct)
         out.append(
             {
                 "id": str(cand.id),
@@ -204,6 +399,8 @@ def lister_mes_candidatures(
                 "offre_titre": offre.title,
                 "statut": cand.statut.value if cand.statut else "nouvelle",
                 "score_ia": _normalize_score_ia(cand.score_cv_matching),
+                "score_final_pct": score_final_pct,
+                "statut_synthese": statut_synthese,
             }
         )
     return out
@@ -366,8 +563,17 @@ def get_candidature_details(
             .order_by(desc(TestOral.id))
             .first()
         )
-        if test_oral is not None and test_oral.score_oral is not None:
-            score_oral = float(test_oral.score_oral)
+        if test_oral is not None and test_oral.score_oral_global is not None:
+            score_oral = float(test_oral.score_oral_global)
+
+    oral_elig = _offre_oral_eligible(offre)
+    score_final_percent = compute_candidate_final_score_percent(
+        candidature.score_cv_matching,
+        score_ecrit,
+        score_oral,
+        oral_elig,
+    )
+    statut_synthese = synthese_statut_from_final(score_final_percent)
 
     cv_url = _resolve_cv_url(request, candidat, candidature)
 
@@ -385,10 +591,12 @@ def get_candidature_details(
             else None,
             "score_ecrit": score_ecrit,
             "score_oral": score_oral,
+            "score_final_percent": score_final_percent,
         },
         "status": {
             "statut": candidature.statut.value if candidature.statut else "nouvelle",
             "etape_actuelle": _read_etape_actuelle(db, candidature.id),
+            "statut_synthese": statut_synthese,
         },
         "offre_titre": offre.title,
     }

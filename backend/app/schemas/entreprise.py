@@ -1,9 +1,11 @@
 """
 Schémas Pydantic pour Entreprise.
 """
-from pydantic import BaseModel, EmailStr, Field
 from datetime import datetime
 from typing import Optional
+from uuid import UUID
+
+from pydantic import BaseModel, EmailStr, Field
 
 
 class EntrepriseBase(BaseModel):
@@ -51,3 +53,12 @@ class EntrepriseResponse(EntrepriseBase):
 class TokenData(BaseModel):
     id: str
     email: str
+
+
+class SendCandidateEmailRequest(BaseModel):
+    """Envoi manuel d’un email au candidat depuis le dashboard entreprise (contenu validé côté API)."""
+
+    candidature_id: UUID
+    to: EmailStr
+    subject: str = Field(..., min_length=1, max_length=500)
+    message: str = Field(..., min_length=1, max_length=50_000)

@@ -1,10 +1,10 @@
 import { motion } from "framer-motion";
 import { useNavigate } from "react-router-dom";
+import { BrandLogo } from "@/components/BrandLogo";
 import { Button } from "@/components/ui/button";
 import {
   ArrowRight,
   BarChart3,
-  Briefcase,
   CheckCircle2,
   Clock,
   Shield,
@@ -50,10 +50,7 @@ const Index = () => {
     <div className="min-h-screen bg-background">
       <nav className="fixed top-0 z-50 w-full border-b bg-card/80 backdrop-blur-md">
         <div className="container mx-auto flex h-16 items-center justify-between px-6">
-          <div className="flex items-center gap-2">
-            <Briefcase className="h-6 w-6 text-accent" />
-            <span className="text-xl font-bold text-foreground">DigitRec</span>
-          </div>
+          <BrandLogo variant="light" size="md" />
           <div className="flex items-center gap-4">
             <Button
               variant="ghost"
@@ -196,10 +193,7 @@ const Index = () => {
 
       <footer className="border-t py-8">
         <div className="container mx-auto flex items-center justify-between px-6 text-sm text-muted-foreground">
-          <div className="flex items-center gap-2">
-            <Briefcase className="h-4 w-4 text-accent" />
-            DigiRec
-          </div>
+          <BrandLogo variant="light" size="sm" className="opacity-90" />
           <p>© 2026 DigitRec. Tous droits reserves.</p>
         </div>
       </footer>

@@ -14,6 +14,7 @@ from app.models.offre import Offre
 from app.models.candidat import Candidat
 from app.models.candidature import Candidature, StatutCandidature
 from app.services.cv_filtering import run_cv_filtering_for_candidature
+from app.services.offre_public_access import offre_est_expiree, offre_statut_manuellement_actif
 
 router = APIRouter(prefix="/candidatures", tags=["Candidatures"])
 settings = get_settings()
@@ -32,16 +33,24 @@ def soumettre_candidature(
     candidat: Candidat = Depends(get_candidat_from_token),
     db: Session = Depends(get_db),
 ):
-    offre = (
-        db.query(Offre)
-        .filter(Offre.token_liens == token, Offre.status == "active")
-        .first()
-    )
+    offre = db.query(Offre).filter(Offre.token_liens == token).first()
 
     if not offre:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Offre introuvable ou inactive.",
+            detail="Lien non disponible ou offre introuvable.",
+        )
+
+    if not offre_statut_manuellement_actif(offre):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Cette offre a été désactivée. Le lien de candidature n’est plus actif.",
+        )
+
+    if offre_est_expiree(offre):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="La période de candidature pour cette offre est terminée.",
         )
 
     if not cv.filename or not _allowed_extension(cv.filename):

@@ -4,7 +4,7 @@ Modèle test écrit (table Supabase tests_ecrits).
 import uuid
 
 from sqlalchemy import Boolean, Column, Float, ForeignKey
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 
 from app.database import Base
 
@@ -21,3 +21,5 @@ class TestEcrit(Base):
     )
     score_ecrit = Column(Float, nullable=False)
     status_reussite = Column(Boolean, nullable=False, default=False)
+    # Snapshot minimal QCM / exercice au moment de la soumission (rapport entreprise).
+    detail_snapshot = Column(JSONB, nullable=True)
