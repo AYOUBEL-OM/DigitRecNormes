@@ -119,7 +119,7 @@ const Index = () => {
               Demarrer maintenant
               <ArrowRight className="ml-2 h-5 w-5" />
             </Button>
-            <Button variant="hero-outline" size="lg" className="text-base" onClick={() => navigate("/dashboard")}>
+            <Button variant="hero-outline" size="lg" className="text-base" onClick={() => navigate("/register")}>
               Ouvrir mon espace
             </Button>
           </motion.div>
