@@ -45,8 +45,17 @@ const ALERT_COOLDOWN_MS = 5000;
 /** Alertes téléphone masquées côté UI (événements / scoring / rapport inchangés). */
 const SILENCED_PHONE_WARNING_IDS = new Set(["phone", "phone_hb"]);
 
-/** Présence : visage absent / vidéo non prête sur N heartbeats consécutifs avant anomalie. */
-const PRESENCE_ANOMALY_HEARTBEATS_REQUIRED = 3;
+/** Présence : visage absent / vidéo non prête sur N heartbeats consécutifs avant anomalie (aligné backend ~6–8). */
+const PRESENCE_ANOMALY_HEARTBEATS_REQUIRED = 6;
+/** Entre deux envois `presence_anomaly` (anti micro-coupures / lag). */
+const PRESENCE_ANOMALY_COOLDOWN_MS = 9000;
+/** Téléphone : preuves strictes uniquement (posture + streak + regard bas). */
+const PHONE_STRICT_COMBINED_MIN = 0.65;
+const PHONE_STRICT_STREAK_MIN = 4;
+const PHONE_STRICT_DOWN_RATIO_MIN = 0.7;
+/** Échantillons gaze consécutifs (~400 ms) ou heartbeats cohérents avant événement réseau. */
+const PHONE_STRICT_SAMPLE_TICKS = 3;
+const PHONE_EVENT_COOLDOWN_MS = 14000;
 /** Regard hors cadre : N heartbeats consécutifs avant anomalie « off_frame ». */
 const OFF_FRAME_ANOMALY_HEARTBEATS_REQUIRED = 3;
 /** Multi-visages : N heartbeats consécutifs avec faces_count ≥ 2 (aligné flush). */
@@ -430,6 +439,14 @@ export function useOralProctoring({
   /** Heartbeats consécutifs où `dominant_gaze_direction === "down"` (période ~1,2 s). */
   const phoneDownDominantHbStreakRef = useRef(0);
   const lastPhoneRawDebugLogAtRef = useRef(0);
+  /** Frame stricte téléphone : confirmée sur plusieurs ticks / heartbeats. */
+  const phoneStrictSampleStreakRef = useRef(0);
+  const lastStrictPhoneFrameRef = useRef(false);
+  const phoneStrictHeartbeatStreakRef = useRef(0);
+  /** Dernière readyState <video> (pour preuve heartbeat). */
+  const lastVideoReadyStateRef = useRef(0);
+  /** Hystérésis présence : il faut 2 heartbeats « bons » pour effacer le compteur manquant. */
+  const presenceGoodStreakRef = useRef(0);
   /** Heartbeats consécutifs : vidéo non prête ou visage non visible. */
   const presenceMissingHbCountRef = useRef(0);
   /** Heartbeats consécutifs avec faces_count ≥ 2 (payload). */
@@ -615,7 +632,7 @@ export function useOralProctoring({
     if (!Ctor) {
       console.log("[PROCTORING] DETECTOR INIT FAIL (API absente)");
       console.warn(
-        "[PROCTORING] FaceDetector indisponible — fallback regard « center » dès que la vidéo a des dimensions (HAVE_METADATA+).",
+        "[PROCTORING] FaceDetector indisponible — les heartbeats enverront faces_count=0 et regard « unknown » (pas de faux centre).",
       );
     } else {
       try {
@@ -692,6 +709,9 @@ export function useOralProctoring({
 
     /** Pas de modèle de détection d’objets : posture / regard seulement. Seuil 0,25 aligné backend. */
     const attemptForcedPhoneDetected = (metaLike: Record<string, unknown>): boolean => {
+      const nowT = Date.now();
+      if (nowT - lastPhoneDetectedSentAtRef.current < PHONE_EVENT_COOLDOWN_MS) return false;
+
       const ppsRaw = metaLike.phone_posture_score;
       const pps =
         typeof ppsRaw === "number" && Number.isFinite(ppsRaw) ? ppsRaw : Number(ppsRaw ?? 0);
@@ -700,8 +720,13 @@ export function useOralProctoring({
         typeof pstRaw === "number" && Number.isFinite(pstRaw)
           ? Math.round(pstRaw)
           : Math.round(Number(pstRaw ?? 0));
+      const win = lastGazeWindowMetricsRef.current;
+      const downRatio =
+        typeof metaLike.gaze_down_ratio === "number" && Number.isFinite(metaLike.gaze_down_ratio)
+          ? metaLike.gaze_down_ratio
+          : (win?.gaze_down_ratio ?? 0);
       const robjs = Array.isArray(metaLike.objects) ? (metaLike.objects as unknown[]) : [];
-      const hasObj = robjs.some((o) => {
+      const hasStrictObj = robjs.some((o) => {
         const s = String(o).toLowerCase().trim();
         return (
           s.includes("phone") ||
@@ -711,24 +736,30 @@ export function useOralProctoring({
           s.includes("cell phone")
         );
       });
-      const hbDownOk = phoneDownDominantHbStreakRef.current >= 2;
-      const ok =
-        (Number.isFinite(pps) && pps >= 0.25) ||
-        pstk >= 1 ||
-        hasObj ||
-        hbDownOk;
-      if (!ok) return false;
+      const strictShape =
+        Number.isFinite(pps) &&
+        pps >= PHONE_STRICT_COMBINED_MIN &&
+        pstk >= PHONE_STRICT_STREAK_MIN &&
+        downRatio >= PHONE_STRICT_DOWN_RATIO_MIN;
+      const evidenceOk =
+        hasStrictObj ||
+        phoneStrictSampleStreakRef.current >= PHONE_STRICT_SAMPLE_TICKS ||
+        phoneStrictHeartbeatStreakRef.current >= 3 ||
+        (strictShape &&
+          phoneStrictSampleStreakRef.current >= PHONE_STRICT_SAMPLE_TICKS &&
+          phoneStrictHeartbeatStreakRef.current >= 2);
+      if (!evidenceOk) return false;
+
       phoneDetectedLatchRef.current = true;
-      const nowT = Date.now();
-      if (nowT - lastPhoneDetectedSentAtRef.current < 2500) return false;
       lastPhoneDetectedSentAtRef.current = nowT;
       const metadata: Record<string, unknown> = {
         phone_detected: true,
         phone_suspected: true,
         phone_posture_score: round3(Number.isFinite(pps) ? pps : 0),
         phone_posture_streak: Math.max(0, pstk),
-        objects: ["phone"],
-        source: "frontend_phone_debug",
+        phone_confidence: round3(Number.isFinite(pps) ? pps : 0),
+        objects: hasStrictObj ? ["phone"] : [],
+        source: "frontend_phone_strict",
         timestamp: nowT,
       };
       console.log("[PHONE DETECTED - SILENT]", metadata);
@@ -778,8 +809,12 @@ export function useOralProctoring({
       const fv = mm.face_visible === true;
       if (vn || !fv) {
         presenceMissingHbCountRef.current += 1;
+        presenceGoodStreakRef.current = 0;
       } else {
-        presenceMissingHbCountRef.current = 0;
+        presenceGoodStreakRef.current += 1;
+        if (presenceGoodStreakRef.current >= 2) {
+          presenceMissingHbCountRef.current = 0;
+        }
       }
       const sustainedPresence =
         presenceMissingHbCountRef.current >= PRESENCE_ANOMALY_HEARTBEATS_REQUIRED;
@@ -808,6 +843,11 @@ export function useOralProctoring({
       } else {
         phoneDownDominantHbStreakRef.current = 0;
       }
+      if (lastStrictPhoneFrameRef.current) {
+        phoneStrictHeartbeatStreakRef.current += 1;
+      } else {
+        phoneStrictHeartbeatStreakRef.current = 0;
+      }
       attemptForcedPhoneDetected(hbPayload as Record<string, unknown>);
 
       const gzHb = String(
@@ -832,7 +872,7 @@ export function useOralProctoring({
       if (sustainedPresence) {
         if (!presenceAnomalyEpisodeActiveRef.current) {
           const nowMs = Date.now();
-          if (nowMs - lastPresenceAnomalySentAtRef.current > 2500) {
+          if (nowMs - lastPresenceAnomalySentAtRef.current > PRESENCE_ANOMALY_COOLDOWN_MS) {
             lastPresenceAnomalySentAtRef.current = nowMs;
             presenceAnomalyEpisodeActiveRef.current = true;
             const metaSend = {
@@ -857,6 +897,23 @@ export function useOralProctoring({
         faces_count: hbPayload.faces_count,
         presenceMissingCount: presenceMissingHbCountRef.current,
         multipleFacesConfirmed: multipleFacesConfirmedRef.current,
+      });
+      console.log("[PROCTORING REAL PAYLOAD]", {
+        event_type: "gaze_heartbeat",
+        faces_count: hbPayload.faces_count,
+        face_detected: hbPayload.face_detected,
+        face_visible: hbPayload.face_visible,
+        gaze_direction: hbPayload.gaze_direction,
+        gaze_region: hbPayload.gaze_region,
+        phone_detected: hbPayload.phone_detected,
+        phone_suspected: hbPayload.phone_suspected,
+        phone_posture_score: hbPayload.phone_posture_score,
+        presence_anomaly_detected: hbPayload.presence_anomaly_detected,
+        face_detector_available: hbPayload.face_detector_available,
+        camera_inference_unavailable: hbPayload.camera_inference_unavailable,
+        video_not_ready: hbPayload.video_not_ready,
+        video_ready_state: hbPayload.video_ready_state,
+        objects: hbPayload.objects,
       });
       console.log("[PROCTORING PAYLOAD SENT]", hbPayload);
       void send("gaze_heartbeat", hbPayload);
@@ -948,13 +1005,14 @@ export function useOralProctoring({
       );
 
       ensureVideoPlaybackAttempt(video);
+      lastVideoReadyStateRef.current = video.readyState;
 
       const detectorAvailable = Boolean(faceDetectorRef.current);
       const dimsOk = video.videoWidth > 16 && video.videoHeight > 16;
       /**
-       * Avec FaceDetector : attendre HAVE_CURRENT_DATA (≥2) pour des frames exploitables.
-       * Sans FaceDetector (Safari/Firefox) : dès HAVE_METADATA + dimensions, activer le fallback
-       * « 1 visage / center » — évite des heartbeats bloqués à faces_count: 0 si readyState reste < 2.
+       * Avec FaceDetector / MediaPipe : attendre HAVE_CURRENT_DATA (≥2) pour des frames exploitables.
+       * Sans détecteur exploitable mais vidéo dimensionnée : on échantillonne quand même pour envoyer
+       * faces_count=0 / regard unknown (pas de faux « centre » ni visage fictif).
        */
       const canSampleVideo =
         video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA ||
@@ -1210,25 +1268,28 @@ export function useOralProctoring({
         }
       }
 
-      /** Pas de FaceDetector ou échec de detect : heartbeat valide pour agréger le regard côté serveur */
+      /**
+       * Sans MediaPipe ni FaceDetector exploitable : ne pas inventer visage/regard « centre ».
+       * Le backend agrège alors absence de visage / regard inconnu (pas de faux positifs stabilité).
+       */
       if (canSampleVideo && !detectorUsedOk && !mpUsedOk) {
-        if (import.meta.env.DEV) {
-          console.log(
-            "[GAZE] fallback (no usable FaceDetector output): faces_count=1, gaze_direction=center",
-            { readyState: video.readyState, detectorCtorPresent: detectorAvailable },
-          );
-        }
+        console.warn(
+          "[PROCTORING] Inférence visage indisponible — pas de fallback center/1 face",
+          {
+            readyState: video.readyState,
+            detectorCtorPresent: detectorAvailable,
+            dimsOk,
+          },
+        );
         lastBbox.current = null;
         lastFaceCenterY.current = null;
         phoneDownStepStreak.current = 0;
         phoneSuspicionStreak.current = 0;
         gazeStateRef.current = createInitialGazeState();
-        facesCount = 1;
-        faceVisible = true;
-        gaze = "center";
-        gazeConfidence = 0.35;
-        dismissWarning("multi");
-        dismissWarning("gaze_screen");
+        facesCount = 0;
+        faceVisible = false;
+        gaze = "unknown";
+        gazeConfidence = 0.2;
       }
 
       const detectionFacesCount = facesCount;
@@ -1268,7 +1329,10 @@ export function useOralProctoring({
         multiFaceSampleStreakRef.current = 0;
       }
 
-      facesCount = ignoreFaceGeom ? lastStableFacesCountRef.current : detectionFacesCount;
+      facesCount =
+        ignoreFaceGeom && detectionFacesCount > 0
+          ? lastStableFacesCountRef.current
+          : detectionFacesCount;
       faceVisible = facesCount >= 1;
 
       multipleFacesConfirmedRef.current =
@@ -1319,32 +1383,26 @@ export function useOralProctoring({
       const framePps = phonePostureScoreLast ?? 0;
       const combinedPhonePosture = Math.round(Math.max(framePps, windowPhone) * 1000) / 1000;
       const phonePostureStreakVal = phoneSuspicionStreak.current;
-      const PHONE_SCORE_DETECT = 0.25;
-      const strongPhoneRule =
-        win.gaze_down_ratio > 0.45 || phonePostureStreakVal >= 2;
-      const scoreRule = combinedPhonePosture >= PHONE_SCORE_DETECT;
-      const downHbOk = phoneDownDominantHbStreakRef.current >= 2;
-      const phoneDetectedNow =
-        strongPhoneRule ||
-        scoreRule ||
-        downHbOk ||
-        phonePostureStreakVal >= 1 ||
-        (phonePostureScoreLast ?? 0) >= 0.25 ||
-        combinedPhonePosture >= 0.25 ||
-        phoneDetectedLatchRef.current;
-      if (phoneDetectedNow) {
+      const strictPhoneFrame =
+        combinedPhonePosture >= PHONE_STRICT_COMBINED_MIN &&
+        phonePostureStreakVal >= PHONE_STRICT_STREAK_MIN &&
+        win.gaze_down_ratio >= PHONE_STRICT_DOWN_RATIO_MIN;
+      lastStrictPhoneFrameRef.current = strictPhoneFrame;
+      if (strictPhoneFrame) {
+        phoneStrictSampleStreakRef.current += 1;
+      } else {
+        phoneStrictSampleStreakRef.current = 0;
+      }
+
+      const phoneStrictOk =
+        phoneStrictSampleStreakRef.current >= PHONE_STRICT_SAMPLE_TICKS ||
+        phoneStrictHeartbeatStreakRef.current >= 3;
+      if (phoneStrictOk) {
         phoneDetectedLatchRef.current = true;
       }
       const phoneDetected = phoneDetectedLatchRef.current;
 
       const objects: string[] = [];
-      if (
-        (phonePostureScoreLast ?? 0) >= 0.25 ||
-        combinedPhonePosture >= 0.25 ||
-        phoneDetected
-      ) {
-        objects.push("phone");
-      }
 
       const suspiciousGaze =
         Boolean(win.suspicious_gaze) || Boolean(suspiciousGazeRatio) || win.gaze_off_ratio > 0.5;
@@ -1377,8 +1435,10 @@ export function useOralProctoring({
         confidence: Math.round(gazeConfidence * 1000) / 1000,
         rapid_motion: rapidMotion,
         face_detector_available: detectorUsedOk || mpUsedOk,
+        camera_inference_unavailable: !(detectorUsedOk || mpUsedOk),
         mediapipe_available: Boolean(mpRef.current),
         mediapipe_used: mpUsedOk,
+        video_ready_state: lastVideoReadyStateRef.current,
         timestamp: Date.now(),
         tab_switch: false,
         fullscreen_exit: false,
@@ -1403,7 +1463,8 @@ export function useOralProctoring({
         phone_detected: phoneDetected,
         presence_anomaly_detected: false,
         multiple_faces_confirmed: multipleFacesConfirmedRef.current,
-        ...(combinedPhonePosture >= PHONE_SCORE_DETECT || phoneDetected
+        ...((combinedPhonePosture >= 0.48 && phonePostureStreakVal >= 2) ||
+        (combinedPhonePosture >= PHONE_STRICT_COMBINED_MIN && phonePostureStreakVal >= 3)
           ? { phone_suspected: true }
           : {}),
         ...(multipleFacesConfirmedRef.current
@@ -1453,7 +1514,7 @@ export function useOralProctoring({
             rapid_ratio: win.window_rapid_ratio,
             streak: phonePostureStreakVal,
             detected: phoneDetected,
-            strong_rule: strongPhoneRule,
+            strict_phone_frame: strictPhoneFrame,
             window_phone_raw: windowPhone,
           });
         }
@@ -1493,7 +1554,12 @@ export function useOralProctoring({
       lastGazeWindowMetricsRef.current = null;
       phoneDetectedLatchRef.current = false;
       phoneDownDominantHbStreakRef.current = 0;
+      phoneStrictSampleStreakRef.current = 0;
+      lastStrictPhoneFrameRef.current = false;
+      phoneStrictHeartbeatStreakRef.current = 0;
+      lastVideoReadyStateRef.current = 0;
       lastPhoneRawDebugLogAtRef.current = 0;
+      presenceGoodStreakRef.current = 0;
       presenceAnomalyEpisodeActiveRef.current = false;
       lastPresenceAnomalySentAtRef.current = 0;
       presenceMissingHbCountRef.current = 0;

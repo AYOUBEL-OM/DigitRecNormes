@@ -1943,7 +1943,7 @@ def _is_generic_intro_only(transcript: str, question_keywords: set[str]) -> bool
     if not _GENERIC_ANSWER_RE.search(t):
         return False
     ov = _keyword_overlap_ratio(question_keywords, t)
-    return ov < 0.08
+    return ov < 0.065
 
 
 def _score_hard_gate_near_zero(kw: float, sim: float) -> float:
@@ -1969,21 +1969,179 @@ def _hard_gate_obvious_off_topic(
     return False
 
 
+# Sous-chaînes sur texte accent-neutralisé (`_strip_accents_lower`).
+# Attention : « postulé » ne contient pas « poste », d’où « postul » explicite.
+_MOTIVATION_REPLY_SIGNAL_TOKENS: tuple[str, ...] = (
+    "postul",
+    "candidat",
+    "candidature",
+    "motivation",
+    "pourquoi",
+    "entreprise",
+    "poste",
+    "equipe",
+    "role",
+    "mission",
+    "projet",
+    "valeur",
+    "parcours",
+    "experience",
+    "technique",
+    "professionnel",
+    "apprentiss",
+    "competence",
+    "developpement",
+    "integration",
+    "rejoindre",
+    "contribuer",
+    "environnement",
+    "domaine",
+    "secteur",
+    "opportunit",
+    "evolution",
+    "defi",
+    "challenge",
+    "cursus",
+    "formation",
+    "interess",
+    "curios",
+    "ambition",
+    "aspiration",
+    "offre",
+)
+
+
+def _motivation_answer_signals_present(tnorm: str) -> bool:
+    """Réponse plausible à une question motivation / pourquoi postuler."""
+    tn = (tnorm or "").strip()
+    return any(tok in tn for tok in _MOTIVATION_REPLY_SIGNAL_TOKENS)
+
+
+def _question_answer_token_overlap_frac(question_text: str, transcript: str) -> float:
+    qt = _tokenize_multilingual(question_text)
+    tt = _tokenize_multilingual(transcript)
+    if not qt:
+        return 0.0
+    return len(qt & tt) / max(len(qt), 1)
+
+
+def _trivial_short_answer_blocked(tnorm: str, word_count: int) -> bool:
+    """Ultra-courtes / placeholders : pas de réhaussement « short-but-coherent »."""
+    if word_count < 3:
+        return True
+    s = " ".join((tnorm or "").split()).strip()
+    if word_count <= 4 and len(s) <= 36:
+        if re.fullmatch(r"(oui|non|ouais|nan|nah|bah|hum+|euh+)\b[!.?…]{0,2}", s):
+            return True
+        if re.fullmatch(r"(je ne sais pas|j\s*ne\s*sais\s+pas|aucune\s+idee)\b.*", s):
+            return True
+        if s in ("parce que", "par ce que") or (s.startswith("parce ") and word_count <= 3):
+            return True
+        if re.fullmatch(r"je\s+sais\s+pas(\s+grand[\s\-]?chose)?[!.?…]{0,2}", s):
+            return True
+    return False
+
+
+def _finalize_short_coherent_relevance(
+    score_in: float,
+    transcript: str,
+    question_text: str,
+    *,
+    kw_overlap: float,
+    sim_qa: float,
+    rep_score: float,
+    source: str,
+) -> tuple[float, dict[str, Any]]:
+    """
+    Fine-tuning : réponses relativement courtes mais liées au sujet → plancher léger (~45).
+    Reste désactivée si lien faible, cohérence basse ou réponses triviales (« oui », « je sais pas »).
+    """
+    t_raw = (transcript or "").strip()
+    tn = _strip_accents_lower(t_raw)
+    words = re.findall(
+        r"[\wàâäéèêëïîôùûç'-]+|[\u0600-\u06FF]+",
+        t_raw,
+        re.I,
+    )
+    wc = len(words)
+    coherence = compute_text_coherence_score(t_raw)
+    hes_hint = float(hesitation_score_combined(45, transcript))
+    lex_ov = float(_question_answer_token_overlap_frac(question_text, transcript))
+    link_ok = kw_overlap >= 0.03 or sim_qa >= 0.115 or lex_ov >= 0.065
+
+    base_dbg: dict[str, Any] = {
+        "transcript": (t_raw[:420] + "…") if len(t_raw) > 420 else t_raw,
+        "word_count": wc,
+        "keyword_overlap": round(kw_overlap, 4),
+        "qa_similarity": round(sim_qa, 4),
+        "qa_token_overlap": round(lex_ov, 4),
+        "coherence_score": round(coherence, 2),
+        "hesitation": round(hes_hint, 2),
+        "short_answer_adjustment": 0.0,
+        "final_relevance": round(float(score_in), 2),
+        "final_quality": round(float(0.5 * score_in + 0.5 * coherence), 2),
+        "source": source,
+    }
+
+    if (
+        wc >= 9
+        and len(t_raw) >= 28
+        and coherence >= 43.5
+        and rep_score < 62.0
+        and hes_hint < 71.0
+        and link_ok
+        and not _trivial_short_answer_blocked(tn, wc)
+        and score_in < 45.0
+    ):
+        # Plancher ~45 : ne remplace pas un score déjà ≥ 45 ; plafond doux pour rester « courte ».
+        floor_score = float(max(score_in, 45.0))
+        floor_score = float(min(62.5, floor_score))
+        delta = floor_score - float(score_in)
+        fq = round(float(0.35 * floor_score + 0.33 * coherence + 0.32 * (100.0 - hes_hint)), 2)
+        base_dbg["short_answer_adjustment"] = round(delta, 3)
+        base_dbg["final_relevance"] = round(floor_score, 2)
+        base_dbg["final_quality"] = fq
+        print(
+            "SHORT ANSWER DEBUG",
+            base_dbg,
+            flush=True,
+        )
+        return floor_score, base_dbg
+
+    print(
+        "SHORT ANSWER DEBUG",
+        base_dbg,
+        flush=True,
+    )
+    return float(score_in), base_dbg
+
+
 def _heuristic_relevance_banded(question_text: str, transcript: str) -> float:
     """
-    Sans LLM : score strict par bandes à partir de similarité surface + chevauchement mots-clés.
+    Sans LLM : score continu (similarité, mots-clés, diversité lexicale) avec pénalités hors-sujet / trop court.
     """
     sim = similarity_question_answer(question_text, transcript)
     qkw = _question_domain_keywords(question_text)
     kw = _keyword_overlap_ratio(qkw, transcript)
-    combined = 0.32 * sim + 0.68 * kw
+    t = (transcript or "").strip()
+    words = re.findall(
+        r"[\wàâäéèêëïîôùûç'-]+|[\u0600-\u06FF]+",
+        t.lower(),
+    )
+    wc = len(words)
+    uniq_ratio = len(set(words)) / max(wc, 1) if wc else 0.0
+    lex = min(1.0, uniq_ratio * 1.08)
+    combined = 0.22 * float(sim) + 0.54 * float(kw) + 0.24 * lex
     if len(qkw) >= 2 and kw < 0.02 and sim < 0.11:
         combined = min(combined, 0.09)
-    if combined < 0.16:
-        return float(max(0.0, min(20.0, 3.0 + combined * 95.0)))
-    if combined < 0.42:
-        return float(30.0 + (combined - 0.16) / 0.26 * 30.0)
-    return float(min(100.0, 70.0 + (combined - 0.42) / 0.58 * 30.0))
+    score = 12.0 + combined * 78.0
+    if wc > 0 and wc < 14:
+        score -= min(18.5, (14 - wc) * 1.38)
+    if _hard_gate_obvious_off_topic(qkw, kw, sim):
+        score = min(score, 22.0)
+    elif kw < 0.06 and sim < 0.18:
+        score = min(score, 42.0)
+    return float(max(0.0, min(100.0, score)))
 
 
 def _groq_relevance_score_llm(
@@ -2023,8 +2181,9 @@ def _groq_relevance_score_llm(
             f"Answer:\n{a}\n\n"
             "Score how well the answer addresses the question (depth and fit).\n\n"
             "Rules:\n"
-            "- Weak but on-topic → 21–35\n"
-            "- Partially addresses the question → 30–60\n"
+            "- Brief but clearly on-topic and coherent → 45–58 (do not over-penalize length alone)\n"
+            "- Weak or thin but still on-topic → 32–48\n"
+            "- Partially addresses the question → 45–65\n"
             "- Clearly answers with substance → 70–100\n\n"
             "Return ONLY a number from 0 to 100, no other text."
         )
@@ -2137,13 +2296,13 @@ def relevance_score_from_text(
             )
             return score
 
-    # Q3 motivation : si aucun mot-clé, cap bas.
+    # Q3 motivation / « pourquoi postuler » : cap bas seulement sans signal sémantique utile.
     if any(k in qn for k in ("pourquoi", "postul", "motivation", "candid")):
-        if not _has_any(["motivation", "poste", "entreprise", "competence", "compétence", "interet", "intérêt", "mission", "valeur", "projet"]):
+        if not _motivation_answer_signals_present(tn):
             score = 30.0
             print(
                 "ANSWER QUALITY DEBUG:",
-                {"question": (question_text or "")[:120], "cap": "q3_keywords_missing", "relevance_score": score},
+                {"question": (question_text or "")[:120], "cap": "q3_motivation_signals_missing", "relevance_score": score},
                 flush=True,
             )
             return score
@@ -2240,6 +2399,15 @@ def relevance_score_from_text(
         # Post-cap : évite un 80+ sur réponse très répétitive / pauvre
         if rep_score >= 65 and not _is_intro_question(question_text):
             score = min(score, 35.0)
+        score, _ = _finalize_short_coherent_relevance(
+            score,
+            transcript,
+            question_text,
+            kw_overlap=kw,
+            sim_qa=sim,
+            rep_score=rep_score,
+            source="groq_llm",
+        )
         logger.info(
             "Relevance check",
             extra={
@@ -2265,6 +2433,15 @@ def relevance_score_from_text(
     score = _heuristic_relevance_banded(question_text, transcript)
     if rep_score >= 65 and not _is_intro_question(question_text):
         score = min(score, 35.0)
+    score, _ = _finalize_short_coherent_relevance(
+        score,
+        transcript,
+        question_text,
+        kw_overlap=kw,
+        sim_qa=sim,
+        rep_score=rep_score,
+        source="heuristic",
+    )
     logger.info(
         "Relevance check",
         extra={
@@ -2454,7 +2631,7 @@ def answer_confidence_score_from_signals(
     base -= min(22.0, hes_mark * 7.0)
     wc = len(t.split())
     if wc < 6:
-        base -= 12.0
+        base -= 9.0
     return float(max(5.0, min(100.0, base)))
 
 
@@ -2593,8 +2770,16 @@ def analyze_answer_row(
             print("AI ANALYSIS DONE", flush=True)
     except Exception as exc:
         logger.exception("AI relevance failed, fallback used: %s", exc)
-        # Fallback demandé : ne jamais bloquer l’UX si l’IA est indisponible
-        rel = 50.0
+        try:
+            rel = _heuristic_relevance_banded(question_text, transcript)
+        except Exception:
+            rel = max(
+                28.0,
+                min(
+                    68.0,
+                    36.0 + min(len((transcript or "").split()) * 1.15, 28.0),
+                ),
+            )
     coherence = compute_text_coherence_score(transcript)
     clarity = clarity_score_from_text(transcript)
     langq = language_quality_score_from_text(transcript)
@@ -2607,6 +2792,27 @@ def analyze_answer_row(
         "analyze_answer_row: final transcript_len=%s provider_used=%s",
         len(transcript or ""),
         source,
+    )
+
+    lex_div = _lexical_diversity_score(transcript)
+    comp_quality = float(
+        max(
+            0.0,
+            min(
+                100.0,
+                float(rel) * 0.5 + (100.0 - float(hes)) * 0.2 + float(coherence) * 0.3,
+            ),
+        )
+    )
+    print(
+        "ANSWER FINAL DEBUG",
+        {
+            "relevance": round(rel, 2),
+            "hesitation": round(hes, 2),
+            "lexicalDiversity": round(lex_div, 2),
+            "finalQuality": round(comp_quality, 2),
+        },
+        flush=True,
     )
 
     return {
@@ -2641,6 +2847,20 @@ def apply_batch_relevance_to_analysis(
     Recalcule scores dépendants de la pertinence après une note agrégée (appel LLM unique en fin de session).
     """
     rel = float(max(0.0, min(100.0, relevance_override)))
+    rep_meta = detect_repetitive_answer(transcript)
+    rep_score = float(rep_meta.get("repetition_score") or 0.0)
+    qkw = _question_domain_keywords(question_text)
+    kw = _keyword_overlap_ratio(qkw, transcript)
+    sim = similarity_question_answer(question_text, transcript)
+    rel, _ = _finalize_short_coherent_relevance(
+        rel,
+        transcript,
+        question_text,
+        kw_overlap=kw,
+        sim_qa=sim,
+        rep_score=rep_score,
+        source="batch_relevance",
+    )
     clarity = float(base.get("clarity_score") or 0.0)
     langq = float(base.get("language_quality_score") or 0.0)
     aconf = float(base.get("confidence_score") or 0.0)

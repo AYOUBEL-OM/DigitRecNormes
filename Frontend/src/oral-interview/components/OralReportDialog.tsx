@@ -86,6 +86,8 @@ type OralReportPayload = {
   };
   behavioral_analysis?: {
     visual?: string;
+    movement?: string;
+    presence?: string;
     stress?: string;
     confidence?: string;
     suspicion?: string;
@@ -496,6 +498,12 @@ const OralReportDialog = ({
                     ) : null}
                     {data.behavioral_analysis?.visual && !data.proctoring_insights?.gaze_professional ? (
                       <li>- {data.behavioral_analysis.visual}</li>
+                    ) : null}
+                    {data.behavioral_analysis?.movement && !data.proctoring_insights?.movement_professional ? (
+                      <li>- {data.behavioral_analysis.movement}</li>
+                    ) : null}
+                    {data.behavioral_analysis?.presence && !data.proctoring_insights?.presence_professional ? (
+                      <li>- {data.behavioral_analysis.presence}</li>
                     ) : null}
                     {data.behavioral_analysis?.suspicion && !data.proctoring_insights?.suspicion_professional ? (
                       <li>- {data.behavioral_analysis.suspicion}</li>

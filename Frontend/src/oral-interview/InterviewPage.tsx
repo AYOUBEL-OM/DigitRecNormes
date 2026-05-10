@@ -364,7 +364,7 @@ const InterviewPage = () => {
 
   useEffect(() => {
     if (!proctoringEnabled || !token) return;
-    const id = window.setInterval(() => void postOralVideoSnapshot("interval"), 45000);
+    const id = window.setInterval(() => void postOralVideoSnapshot("interval"), 7500);
     void postOralVideoSnapshot("interval");
     return () => clearInterval(id);
   }, [proctoringEnabled, token, postOralVideoSnapshot]);

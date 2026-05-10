@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -220,12 +221,15 @@ def normalize_proctoring_flags(raw: Any) -> dict[str, Any]:
         "gaze_off_hb_streak",
         "face_detected_false_hb_streak",
         "presence_anomaly_events",
+        "server_phone_confirmation_count",
     ):
         base["counters"].setdefault(k, 0)
     base["counters"].setdefault("phone_evidence_sum", 0.0)
     base["counters"].setdefault("phone_confidence_peak", 0.0)
     base["counters"].setdefault("max_faces_count", 0)
     base["counters"].setdefault("phone_posture_streak", 0)
+    base["counters"].setdefault("phone_strict_object_events", 0)
+    base["counters"].setdefault("phone_coherent_hb_streak", 0)
     base["counters"].setdefault("client_suspicious_gaze_heartbeats", 0)
     base.setdefault("proctoring_temporal", {})
     if not isinstance(base["proctoring_temporal"], dict):
@@ -235,6 +239,7 @@ def normalize_proctoring_flags(raw: Any) -> dict[str, Any]:
     if not isinstance(pt["gaze_recent"], list):
         pt["gaze_recent"] = []
     pt.setdefault("last_temporal_bonus", 0.0)
+    pt.setdefault("suspicion_score_ema", None)
     pt.setdefault("last_event_ts", [])
     if not isinstance(pt["last_event_ts"], list):
         pt["last_event_ts"] = []
@@ -253,6 +258,49 @@ def _append_timeline(flags: dict[str, Any], entry: dict[str, Any]) -> None:
     tl.append(entry)
     if len(tl) > MAX_TIMELINE:
         del tl[: len(tl) - MAX_TIMELINE]
+
+
+def _object_label_is_phone(label: str) -> bool:
+    """
+    Étiquette d’objet stricte (évite « microphone », « headphones », etc.).
+    """
+    s = (label or "").lower().strip()
+    if not s:
+        return False
+    deny = (
+        "microphone",
+        "headphone",
+        "headphones",
+        "earphone",
+        "earphones",
+        "headset",
+        "telephoto",
+        "saxophone",
+        "gramophone",
+    )
+    if any(d in s for d in deny):
+        return False
+    if s in ("phone", "mobile", "cell", "smartphone", "cell phone", "cellphone", "iphone"):
+        return True
+    tokens = re.findall(r"[a-z0-9]+", s)
+    if "phone" in tokens or "mobile" in tokens or "smartphone" in tokens:
+        return True
+    return False
+
+
+def _metadata_objects_include_phone(meta: dict[str, Any]) -> bool:
+    raw = meta.get("objects")
+    if isinstance(raw, str):
+        return _object_label_is_phone(raw)
+    if isinstance(raw, list):
+        for o in raw:
+            if isinstance(o, str) and _object_label_is_phone(o):
+                return True
+            if isinstance(o, dict):
+                lab = str(o.get("label") or o.get("name") or o.get("class") or "")
+                if _object_label_is_phone(lab):
+                    return True
+    return False
 
 
 def _phone_signal_weight(metadata: dict[str, Any]) -> float:
@@ -286,31 +334,65 @@ def _accumulate_phone_evidence(
         )
 
 
+def _heartbeat_gaze_down_ratio_meta(meta: dict[str, Any]) -> float:
+    v = meta.get("gaze_down_ratio")
+    if isinstance(v, (int, float)):
+        return float(max(0.0, min(1.0, float(v))))
+    return 0.0
+
+
 def _heartbeat_phone_signal(meta: dict[str, Any]) -> bool:
-    """Heartbeat : posture score, drapeau explicite, confiance ou liste d’objets."""
-    if meta.get("phone_suspected") or meta.get("phone_detected") is True:
+    """
+    Preuve « téléphone » pour un heartbeat : ignore posture / regard seuls (seuils élevés + combinaisons).
+    """
+    if _metadata_objects_include_phone(meta):
         return True
+    if meta.get("phone_detected") is True:
+        if _metadata_objects_include_phone(meta):
+            return True
+        pc_f = float(meta["phone_confidence"]) if isinstance(meta.get("phone_confidence"), (int, float)) else None
+        pps_f = float(meta["phone_posture_score"]) if isinstance(meta.get("phone_posture_score"), (int, float)) else None
+        pst = meta.get("phone_posture_streak")
+        pst_i = int(round(float(pst))) if isinstance(pst, (int, float)) and not isinstance(pst, bool) else 0
+        if (
+            pc_f is not None
+            and pc_f >= 0.72
+            and pps_f is not None
+            and pps_f >= 0.52
+            and pst_i >= 3
+        ):
+            return True
+        return False
     pps = meta.get("phone_posture_score")
-    if isinstance(pps, (int, float)) and float(pps) >= 0.25:
-        return True
     pc = meta.get("phone_confidence")
-    if isinstance(pc, (int, float)) and float(pc) >= 0.4:
+    pps_f = float(pps) if isinstance(pps, (int, float)) else None
+    pc_f = float(pc) if isinstance(pc, (int, float)) else None
+    pst = meta.get("phone_posture_streak")
+    pst_i = int(round(float(pst))) if isinstance(pst, (int, float)) and not isinstance(pst, bool) else 0
+    down_r = _heartbeat_gaze_down_ratio_meta(meta)
+    posture_strong = (
+        pps_f is not None
+        and pps_f >= 0.58
+        and pst_i >= 4
+        and down_r >= 0.36
+    )
+    conf_strong = (
+        pc_f is not None
+        and pc_f >= 0.72
+        and pps_f is not None
+        and pps_f >= 0.50
+        and pst_i >= 3
+    )
+    if posture_strong or conf_strong:
         return True
-    objs = meta.get("objects")
-    if isinstance(objs, list):
-        for o in objs:
-            if isinstance(o, str) and o.lower() in ("phone", "mobile", "cell", "smartphone", "cell phone"):
-                return True
-            if isinstance(o, dict):
-                lab = str(o.get("label") or o.get("name") or o.get("class") or "").lower().strip()
-                if lab in ("phone", "mobile", "cell", "smartphone", "cell phone"):
-                    return True
+    if meta.get("phone_suspected") is True and pps_f is not None and pps_f >= 0.62 and pst_i >= 3:
+        return True
     return False
 
 
 def _evaluate_phone_detected(oral: TestOral, ctr: dict[str, Any]) -> None:
     """
-    Fusion multi-signaux : pic confiance, posture répétée (≥2 heartbeats), preuve cumulée.
+    Décision téléphone : plusieurs preuves cohérentes (objets stricts, cumuls pondérés, posture persistante).
     Ne repasse jamais à False une fois True.
     """
     if oral.phone_detected:
@@ -319,31 +401,68 @@ def _evaluate_phone_detected(oral: TestOral, ctr: dict[str, Any]) -> None:
     ev = float(ctr.get("phone_evidence_sum") or 0.0)
     peak = float(ctr.get("phone_confidence_peak") or 0.0)
     posture_streak = int(ctr.get("phone_posture_streak") or 0)
-    if peak >= 0.4:
+    strict_obj = int(ctr.get("phone_strict_object_events") or 0)
+    coh_streak = int(ctr.get("phone_coherent_hb_streak") or 0)
+    pd_events = int(ctr.get("phone_detected_events") or 0)
+    srv = int(ctr.get("server_phone_confirmation_count") or 0)
+
+    if strict_obj >= 2:
         oral.phone_detected = True
-    elif posture_streak >= 1:
+    elif strict_obj >= 1 and peak >= 0.62 and cnt >= 2:
         oral.phone_detected = True
-    elif ev >= 0.85:
+    elif coh_streak >= 4 and peak >= 0.55 and ev >= 1.05:
         oral.phone_detected = True
-    elif peak >= 0.4 and cnt >= 1 and ev >= 0.30:
+    elif cnt >= 3 and ev >= 1.35 and peak >= 0.52:
         oral.phone_detected = True
-    elif cnt >= 2 and ev >= 0.60:
+    elif posture_streak >= 6 and peak >= 0.58 and ev >= 1.15 and cnt >= 3:
         oral.phone_detected = True
-    elif cnt >= 3 and ev >= 0.95:
+    elif pd_events >= 3 and ev >= 1.5 and peak >= 0.55:
         oral.phone_detected = True
-    elif cnt >= 4 and ev >= 2.0:
+    elif srv >= 3 and peak >= 0.48 and ev >= 0.95:
         oral.phone_detected = True
+    elif srv >= 2 and peak >= 0.55 and ev >= 1.1 and cnt >= 2:
+        oral.phone_detected = True
+
+    final_decision = bool(oral.phone_detected)
     if oral.phone_detected:
         ctr["phone_detection_peak_confidence"] = round(peak, 3)
+    logger.debug(
+        "PHONE DEBUG %s",
+        {
+            "rawSignals": {
+                "phone_suspected_count": cnt,
+                "phone_evidence_sum": ev,
+                "phone_confidence_peak": peak,
+                "phone_posture_streak": posture_streak,
+                "phone_strict_object_events": strict_obj,
+                "phone_coherent_hb_streak": coh_streak,
+                "phone_detected_events": pd_events,
+                "server_phone_confirmation_count": srv,
+            },
+            "confidence": round(peak, 3),
+            "streak": posture_streak,
+            "evidence": round(ev, 3),
+            "finalDecision": final_decision,
+        },
+    )
     print(
-        "PHONE_DETECTED_EVAL",
+        "PHONE DEBUG",
         {
             "oral_id": str(oral.id),
-            "phone_suspected_count": cnt,
-            "phone_evidence_sum": ev,
-            "phone_confidence_peak": peak,
-            "phone_posture_streak": posture_streak,
-            "phone_detected": oral.phone_detected,
+            "rawSignals": {
+                "phone_suspected_count": cnt,
+                "phone_evidence_sum": ev,
+                "phone_confidence_peak": peak,
+                "phone_posture_streak": posture_streak,
+                "phone_strict_object_events": strict_obj,
+                "phone_coherent_hb_streak": coh_streak,
+                "phone_detected_events": pd_events,
+                "server_phone_confirmation_count": srv,
+            },
+            "confidence": round(peak, 3),
+            "streak": posture_streak,
+            "evidence": round(ev, 3),
+            "finalDecision": final_decision,
         },
         flush=True,
     )
@@ -371,6 +490,7 @@ def compute_suspicion_score(
     head_hb = min(int(ctr.get("suspicious_head_movement_heartbeat_count") or 0), 12)
 
     sg_client = int(ctr.get("client_suspicious_gaze_heartbeats") or 0)
+    tb_capped = min(float(max(0.0, temporal_bonus)), 8.0)
     mf_weight = 14.0 if bool(oral.other_person_detected) else 3.5
     fnv_weight = 10.0 if fnv >= 8 else 4.0
     score = (
@@ -378,12 +498,12 @@ def compute_suspicion_score(
         + float(rapid) * 2.0
         + float(tabs) * 5.0
         + float(fs) * 5.0
-        + phone_ev * 20.0
+        + phone_ev * 14.0
         + float(mf) * mf_weight
         + float(fnv) * fnv_weight
-        + float(max(0.0, temporal_bonus))
-        + min(22.0, float(sg_client) * 3.2)
-        + float(head_hb) * 0.9
+        + tb_capped
+        + min(14.0, float(sg_client) * 2.0)
+        + float(head_hb) * 0.38
     )
     return float(max(0.0, min(100.0, score)))
 
@@ -408,6 +528,9 @@ def gate_suspicion_high_level(
     """
     if level != "HIGH":
         return score, level
+    sc = float(score)
+    if sc < 60.0:
+        return float(min(sc, 58.0)), "MEDIUM"
     ctr = flags.get("counters") if isinstance(flags.get("counters"), dict) else {}
     kinds = (
         (1 if oral.phone_detected else 0)
@@ -417,12 +540,17 @@ def gate_suspicion_high_level(
     pres_ev = int(ctr.get("presence_anomaly_events") or 0)
     mf_ev = int(ctr.get("multiple_faces_count") or 0)
     fnv = int(ctr.get("face_not_visible_count") or 0)
+    persist = float(ctr.get("anomaly_persistence_score") or 0.0)
+    tabs = int(oral.tab_switch_count or 0)
     if kinds >= 2:
         return score, level
-    if pres_ev >= 3 or mf_ev >= 3 or fnv >= 10:
+    if pres_ev >= 4 or mf_ev >= 4 or fnv >= 12:
         return score, level
-    capped = float(min(score, 58.0))
-    return capped, "MEDIUM"
+    if tabs >= 8 and sc >= 64.0 and (pres_ev >= 2 or oral.phone_detected):
+        return score, level
+    if persist >= 18.0 and sc >= 62.0:
+        return score, level
+    return float(min(sc, 56.0)), "MEDIUM"
 
 
 def apply_minimum_suspicion_for_critical_flags(
@@ -452,23 +580,23 @@ def apply_minimum_suspicion_for_critical_flags(
     # Mouvement suspect (toutes sources) : planchers atténués pour limiter les faux positifs
     mv = int(oral.suspicious_movements_count or 0)
     if mv >= 1:
-        out = max(out, 18.0)
+        out = max(out, 12.0)
     if mv >= 2:
-        out = max(out, 26.0)
+        out = max(out, 20.0)
     if flags is not None:
         ctr = flags.get("counters") if isinstance(flags.get("counters"), dict) else {}
         sh = int(ctr.get("suspicious_head_movement_heartbeat_count") or 0)
         if sh >= 1:
-            out = max(out, 10.0)
+            out = max(out, 6.0)
         if sh >= 2:
-            out = max(out, 16.0)
+            out = max(out, 10.0)
         # Si `estimates.head_pose.suspicious_head_movement == true` (ex. métrique client), appliquer le plancher.
         est = flags.get("estimates") if isinstance(flags.get("estimates"), dict) else {}
         hp = est.get("head_pose") if isinstance(est.get("head_pose"), dict) else {}
         if hp.get("suspicious_head_movement") is True:
-            out = max(out, 12.0)
+            out = max(out, 10.0)
         if int(ctr.get("client_suspicious_gaze_heartbeats") or 0) >= 2:
-            out = max(out, 28.0)
+            out = max(out, 18.0)
     return out
 
 
@@ -540,15 +668,15 @@ def _record_heartbeat_temporal(flags: dict[str, Any], gaze_dir: str, meta: dict[
 
     bonus = 0.0
     if len(seq) >= 3 and all(str(x.get("gaze")) == "down" for x in seq[-3:]):
-        bonus += 8.0
+        bonus += 4.0
     last5 = seq[-5:]
     if len(last5) >= 3:
         downs = sum(1 for x in last5 if str(x.get("gaze")) == "down")
         if downs >= 3:
-            bonus += 5.0
+            bonus += 3.0
         raps = sum(1 for x in last5 if x.get("rapid"))
         if raps >= 3:
-            bonus += 7.0
+            bonus += 4.0
     pt["last_temporal_bonus"] = round(bonus, 2)
     return bonus
 
@@ -579,16 +707,49 @@ def _apply_intelligent_detections(oral: TestOral, flags: dict[str, Any]) -> dict
         or _client_window_ratios_suspicious(gw_snap)
     )
 
+    pres_ev_ct = int(ctr.get("presence_anomaly_events") or 0)
+    mf_ct = int(ctr.get("multiple_faces_count") or 0)
+    fnv_ct = int(ctr.get("face_not_visible_count") or 0)
+    phone_ev_ct = float(ctr.get("phone_evidence_sum") or 0.0)
+    persist_raw = (
+        pres_ev_ct * 2.9
+        + mf_ct * 2.4
+        + min(fnv_ct, 24) * 1.6
+        + min(int(oral.tab_switch_count or 0), 22) * 2.1
+        + phone_ev_ct * 5.5
+    )
+    ctr["anomaly_persistence_score"] = round(min(100.0, persist_raw), 2)
+
     _evaluate_phone_detected(oral, ctr)
+    srv_fin = int(ctr.get("server_phone_confirmation_count") or 0)
+    pd_fin = int(ctr.get("phone_detected_events") or 0)
+    print(
+        "PHONE FINAL DEBUG",
+        {
+            "oral_id": str(oral.id),
+            "frontendSignal": {"phone_detected_events": pd_fin, "server_phone_confirmation_count": srv_fin},
+            "heartbeatEvidence": round(float(ctr.get("phone_evidence_sum") or 0.0), 3),
+            "confirmationCount": srv_fin,
+            "finalDecision": bool(oral.phone_detected),
+        },
+        flush=True,
+    )
 
     pt = flags.get("proctoring_temporal") if isinstance(flags.get("proctoring_temporal"), dict) else {}
     temporal_bonus = float(pt.get("last_temporal_bonus") or 0.0)
 
-    suspicion = compute_suspicion_score(oral, flags, temporal_bonus)
-    suspicion = apply_minimum_suspicion_for_critical_flags(oral, suspicion, flags)
-    suspicion = float(max(0.0, min(100.0, suspicion)))
-    risk = suspicion_risk_level(suspicion)
-    suspicion, risk = gate_suspicion_high_level(oral, flags, suspicion, risk)
+    suspicion_raw = compute_suspicion_score(oral, flags, temporal_bonus)
+    suspicion_raw = apply_minimum_suspicion_for_critical_flags(oral, suspicion_raw, flags)
+    suspicion_raw = float(max(0.0, min(100.0, suspicion_raw)))
+    prev_ema = pt.get("suspicion_score_ema")
+    if prev_ema is None:
+        suspicion_smoothed = suspicion_raw
+    else:
+        suspicion_smoothed = round(0.68 * float(prev_ema) + 0.32 * suspicion_raw, 2)
+    pt["suspicion_score_ema"] = suspicion_smoothed
+
+    risk = suspicion_risk_level(suspicion_smoothed)
+    suspicion, risk = gate_suspicion_high_level(oral, flags, suspicion_smoothed, risk)
     behavior_tag = _compute_behavior_tag(suspicion, risk, suspicious_gaze, oral)
 
     print(
@@ -602,6 +763,36 @@ def _apply_intelligent_detections(oral: TestOral, flags: dict[str, Any]) -> dict
             "suspicious_gaze": suspicious_gaze,
             "behavior_tag": behavior_tag,
             "temporal_bonus": temporal_bonus,
+        },
+        flush=True,
+    )
+    print(
+        "SUSPICION FINAL DEBUG",
+        {
+            "oral_id": str(oral.id),
+            "evidence": {
+                "anomaly_persistence_score": ctr.get("anomaly_persistence_score"),
+                "phone_evidence_sum": round(phone_ev_ct, 3),
+            },
+            "weightedSignals": {
+                "raw_score": round(suspicion_raw, 2),
+                "ema_before_gate": round(suspicion_smoothed, 2),
+            },
+            "decay": {"ema_blend": "0.68*ema+0.32*raw"},
+            "finalScore": round(suspicion, 2),
+            "finalLevel": risk,
+        },
+        flush=True,
+    )
+    miss_frames = int(ctr.get("face_missing_hb_streak") or 0)
+    print(
+        "PRESENCE FINAL DEBUG",
+        {
+            "oral_id": str(oral.id),
+            "missingFrames": miss_frames,
+            "presence_anomaly_events": pres_ev_ct,
+            "cooldown": "episode+hysteresis côté client",
+            "anomalyDecision": bool(oral.presence_anomaly_detected),
         },
         flush=True,
     )
@@ -1442,55 +1633,55 @@ def _ingest_client_heartbeat_metrics(flags: dict[str, Any], oral: TestOral, meta
             p_susp,
         )
 
-    objs = meta.get("objects")
-    obj_phone = False
-    if isinstance(objs, list):
-        for o in objs:
-            if not isinstance(o, str):
-                continue
-            s = o.lower().strip()
-            if "phone" in s or s in ("mobile", "smartphone", "cell"):
-                obj_phone = True
-                break
-    phone_signal = bool(
-        p_det
-        or p_susp
-        or obj_phone
-        or (pps is not None and pps >= 0.25)
-    )
-    if phone_signal:
-        oral.phone_detected = True
+    strict_phone_obj = _metadata_objects_include_phone(meta)
+    if strict_phone_obj:
+        ctr["phone_strict_object_events"] = int(ctr.get("phone_strict_object_events") or 0) + 1
+
+    had_phone_evidence = bool(_heartbeat_phone_signal(meta) or strict_phone_obj)
+    if had_phone_evidence:
+        ctr["phone_coherent_hb_streak"] = int(ctr.get("phone_coherent_hb_streak") or 0) + 1
+        w = _phone_signal_weight(meta)
+        if pps is not None:
+            w = max(w, min(1.0, float(pps) * 0.95))
+        _accumulate_phone_evidence(ctr, w, meta)
+        ctr["phone_detected_events"] = int(ctr.get("phone_detected_events") or 0) + 1
         print(
-            "BACKEND PHONE RECEIVED",
+            "BACKEND PHONE EVIDENCE HB",
             {
                 "oral_id": str(oral.id),
-                "phone_detected": True,
                 "phone_posture_score": pps,
                 "phone_posture_streak": pstreak,
                 "objects": meta.get("objects"),
+                "strict_object": strict_phone_obj,
             },
             flush=True,
         )
-        # Compteur explicite (évite ambiguïtés côté rapport)
-        ctr["phone_detected_events"] = int(ctr.get("phone_detected_events") or 0) + 1
-        # Stockage des métriques téléphone côté estimates pour le rapport (sans nouvelles colonnes)
         pm_prev = est.get("phone_metrics") if isinstance(est.get("phone_metrics"), dict) else {}
         pm: dict[str, Any] = dict(pm_prev)
-        pm["phone_detected"] = True
         if pps is not None:
             pm["phone_posture_score"] = round(float(pps), 3)
         if isinstance(pstreak, (int, float)) and not isinstance(pstreak, bool):
             pm["phone_posture_streak"] = int(max(0, round(float(pstreak))))
+        pm["phone_suspected"] = bool(_heartbeat_phone_signal(meta))
         pm["source"] = str(meta.get("source") or "heartbeat")
         pm["updated_at"] = _utc_iso()
         est["phone_metrics"] = pm
-        # Timeline : marquer le 1er signal téléphone (et quelques répétitions), sans spam
         cph = int(ctr.get("phone_suspected_count") or 0)
-        if cph in (0, 1, 2, 4) or cph % 12 == 0:
+        if cph in (1, 2, 5) or cph % 14 == 0:
             _append_timeline(
                 flags,
                 {"type": "phone_detected", "detail": {"source": "heartbeat", "phone_posture_score": pps}},
             )
+    else:
+        ctr["phone_coherent_hb_streak"] = 0
+        prev_ev = float(ctr.get("phone_evidence_sum") or 0.0)
+        ctr["phone_evidence_sum"] = round(prev_ev * 0.965, 3)
+
+    _evaluate_phone_detected(oral, ctr)
+    pm_sync: dict[str, Any] = dict(est.get("phone_metrics") or {})
+    pm_sync["phone_detected"] = bool(oral.phone_detected)
+    pm_sync["updated_at"] = _utc_iso()
+    est["phone_metrics"] = pm_sync
 
     if isinstance(pstreak, (int, float)) and not isinstance(pstreak, bool):
         ps_i = int(max(0, round(float(pstreak))))
@@ -1526,6 +1717,24 @@ def _gaze_stability_label(center_ratio: float, unknown_ratio: float, off_ratio: 
 
 def _apply_heartbeat_payload(flags: dict[str, Any], oral: TestOral, meta: dict[str, Any]) -> None:
     """Échantillon caméra / regard (heartbeat ou gaze_heartbeat, même charge utile)."""
+    print(
+        "BACKEND PROCTORING RECEIVED",
+        {
+            "event_type": "gaze_heartbeat",
+            "faces_count": meta.get("faces_count"),
+            "face_detected": meta.get("face_detected"),
+            "face_visible": meta.get("face_visible"),
+            "gaze_direction": meta.get("gaze_direction"),
+            "phone_detected": meta.get("phone_detected"),
+            "phone_suspected": meta.get("phone_suspected"),
+            "presence_anomaly_detected": meta.get("presence_anomaly_detected"),
+            "phone_posture_score": meta.get("phone_posture_score"),
+            "face_detector_available": meta.get("face_detector_available"),
+            "video_not_ready": meta.get("video_not_ready"),
+            "camera_inference_unavailable": meta.get("camera_inference_unavailable"),
+        },
+        flush=True,
+    )
     faces = int(meta.get("faces_count") if meta.get("faces_count") is not None else -1)
     face_visible = meta.get("face_visible")
     gaze = meta.get("gaze_region") or meta.get("gaze") or meta.get("gaze_direction") or "unknown"
@@ -1559,9 +1768,9 @@ def _apply_heartbeat_payload(flags: dict[str, Any], oral: TestOral, meta: dict[s
 
     pps_hb = meta.get("phone_posture_score")
     if isinstance(pps_hb, (int, float)):
-        if float(pps_hb) >= 0.25:
+        if float(pps_hb) >= 0.48:
             ctr["phone_posture_streak"] = int(ctr.get("phone_posture_streak") or 0) + 1
-        elif float(pps_hb) < 0.20:
+        elif float(pps_hb) < 0.28:
             ctr["phone_posture_streak"] = 0
 
     samp = int(g.get("samples") or 0)
@@ -1577,7 +1786,6 @@ def _apply_heartbeat_payload(flags: dict[str, Any], oral: TestOral, meta: dict[s
             meta.get("video_not_ready"),
         )
 
-    det_avail = meta.get("face_detector_available")
     face_detected = meta.get("face_detected")
     video_nr = meta.get("video_not_ready") is True
     if video_nr:
@@ -1585,8 +1793,10 @@ def _apply_heartbeat_payload(flags: dict[str, Any], oral: TestOral, meta: dict[s
     else:
         ctr["video_not_ready_hb_streak"] = 0
 
-    no_face = (faces == 0 and face_visible is False) or (face_detected is False)
-    if det_avail is not False and no_face:
+    # Présence réelle : ne pas ignorer l’absence de visage lorsque le navigateur n’a pas de FaceDetector
+    # (l’ancienne condition sur face_detector_available créait des sessions « tout centre » artificiellement stables).
+    no_face = faces <= 0 or face_detected is False or face_visible is False
+    if no_face:
         ctr["face_not_visible_count"] = int(ctr.get("face_not_visible_count") or 0) + 1
         ctr["face_missing_hb_streak"] = int(ctr.get("face_missing_hb_streak") or 0) + 1
     else:
@@ -1602,19 +1812,46 @@ def _apply_heartbeat_payload(flags: dict[str, Any], oral: TestOral, meta: dict[s
     else:
         ctr["face_detected_false_hb_streak"] = 0
 
-    _HB_PRESENCE_CONFIRM = 3
+    _HB_VIDEO_NOT_READY_ANOMALY = 8
+    _HB_FACE_MISSING_ANOMALY = 6
     _HB_MULTI_FACE_CONFIRM = 3
 
+    if meta.get("presence_anomaly_detected") is True:
+        ctr["presence_frontend_flag_streak"] = int(ctr.get("presence_frontend_flag_streak") or 0) + 1
+    else:
+        ctr["presence_frontend_flag_streak"] = 0
+
     presence_reason = None
-    if int(ctr.get("video_not_ready_hb_streak") or 0) >= _HB_PRESENCE_CONFIRM:
+    vnr = int(ctr.get("video_not_ready_hb_streak") or 0)
+    fms = int(ctr.get("face_missing_hb_streak") or 0)
+    fdf = int(ctr.get("face_detected_false_hb_streak") or 0)
+    if vnr >= _HB_VIDEO_NOT_READY_ANOMALY:
         presence_reason = "video_not_ready"
-    elif int(ctr.get("face_missing_hb_streak") or 0) >= _HB_PRESENCE_CONFIRM:
+    elif fms >= _HB_FACE_MISSING_ANOMALY:
         presence_reason = "face_missing"
-    elif int(ctr.get("face_detected_false_hb_streak") or 0) >= _HB_PRESENCE_CONFIRM:
+    elif fdf >= _HB_FACE_MISSING_ANOMALY:
         presence_reason = "face_missing"
 
-    if meta.get("presence_anomaly_detected") is True:
+    fe_streak = int(ctr.get("presence_frontend_flag_streak") or 0)
+    if fe_streak >= 4 and meta.get("presence_anomaly_detected") is True:
         presence_reason = presence_reason or str(meta.get("reason") or "frontend_flag")
+
+    if samp % 17 == 0 or presence_reason:
+        print(
+            "PRESENCE DEBUG",
+            {
+                "oral_id": str(oral.id),
+                "faceDetected": face_detected is True,
+                "faceVisible": face_visible is True,
+                "consecutiveMissing": fms,
+                "videoNrStreak": vnr,
+                "faceFalseStreak": fdf,
+                "frontendFlagStreak": fe_streak,
+                "anomalyDecision": bool(presence_reason),
+                "reason": presence_reason,
+            },
+            flush=True,
+        )
 
     before_presence = bool(oral.presence_anomaly_detected)
     if presence_reason:
@@ -1687,47 +1924,6 @@ def _apply_heartbeat_payload(flags: dict[str, Any], oral: TestOral, meta: dict[s
         },
         flush=True,
     )
-    if _heartbeat_phone_signal(meta):
-        ctr["phone_detected_events"] = int(ctr.get("phone_detected_events") or 0) + 1
-        if meta.get("phone_detected") is True:
-            print("BACKEND PHONE RECEIVED", {"event_type": "heartbeat", "meta": meta}, flush=True)
-        print(
-            "PHONE DEBUG:",
-            {
-                "type": "heartbeat",
-                "oral_id": str(oral.id),
-                "payload": {k: meta.get(k) for k in ("phone_suspected", "phone_detected", "phone_confidence", "score", "phone_posture_score", "objects")},
-            },
-            flush=True,
-        )
-        w = _phone_signal_weight(meta)
-        pps = meta.get("phone_posture_score")
-        if isinstance(pps, (int, float)):
-            w = max(w, min(1.0, float(pps) * 0.95))
-        before_ev = float(ctr.get("phone_evidence_sum") or 0.0)
-        before_cnt = int(ctr.get("phone_suspected_count") or 0)
-        before_pd = bool(oral.phone_detected)
-        _accumulate_phone_evidence(ctr, w, meta)
-        if isinstance(meta.get("phone_confidence"), (int, float)) and float(meta["phone_confidence"]) >= 0.4:
-            oral.phone_detected = True
-        if meta.get("phone_detected") is True:
-            oral.phone_detected = True
-        _evaluate_phone_detected(oral, ctr)
-        print(
-            "PHONE SIGNAL (gaze_heartbeat)",
-            {
-                "oral_id": str(oral.id),
-                "weight": w,
-                "phone_evidence_sum_before": before_ev,
-                "phone_evidence_sum_after": ctr.get("phone_evidence_sum"),
-                "phone_suspected_count_before": before_cnt,
-                "phone_suspected_count_after": ctr.get("phone_suspected_count"),
-                "phone_detected_before": before_pd,
-                "phone_detected_after": oral.phone_detected,
-                "pps": meta.get("phone_posture_score"),
-            },
-            flush=True,
-        )
     if meta.get("rapid_motion"):
         ctr["rapid_motion_heartbeat_count"] = int(ctr.get("rapid_motion_heartbeat_count") or 0) + 1
 
@@ -1760,18 +1956,6 @@ def _load_test_oral_after_commit(db: Session, oral: TestOral) -> TestOral:
         return row
     logger.warning("oral_proctoring: TestOral id=%s introuvable après commit, instance d'origine", oid)
     return oral
-
-
-def _compute_cheating_score_and_risk(oral: TestOral, flags: dict[str, Any]) -> tuple[float, str]:
-    """Aligné sur `compute_suspicion_score` + bonus temporel (cœur multi-signaux)."""
-    pt = flags.get("proctoring_temporal") if isinstance(flags.get("proctoring_temporal"), dict) else {}
-    tb = float(pt.get("last_temporal_bonus") or 0.0)
-    s = compute_suspicion_score(oral, flags, tb)
-    s = apply_minimum_suspicion_for_critical_flags(oral, s, flags)
-    s = float(max(0.0, min(100.0, s)))
-    level = suspicion_risk_level(s)
-    s, level = gate_suspicion_high_level(oral, flags, s, level)
-    return s, level
 
 
 # Aucun échantillon gaze : valeur plancher explicite (évite NULL en base tout en signalant l’absence de données).
@@ -1827,10 +2011,12 @@ def apply_proctoring_derived_scores(db: Session, oral: TestOral) -> TestOral:
     """
     ensure_oral_proctoring_fields(oral)
     flags = normalize_proctoring_flags(oral.cheating_flags)
+    yolo_preserve = flags.get("yolo") if isinstance(flags.get("yolo"), dict) else None
     _recompute_gaze_ratios(flags["gaze"])
     _sync_gaze_counters(flags, oral)
     intel = _apply_intelligent_detections(oral, flags)
-    cheat_s, cheat_lvl = _compute_cheating_score_and_risk(oral, flags)
+    cheat_s = float(intel.get("suspicion_score") or 0.0)
+    cheat_lvl = str(intel.get("suspicion_risk_level") or "LOW")
 
     gaze = flags["gaze"]
     samples = max(0, int(gaze.get("samples") or 0))
@@ -1899,6 +2085,8 @@ def apply_proctoring_derived_scores(db: Session, oral: TestOral) -> TestOral:
         }
 
     flags["summary_global"] = build_flags_global_summary(oral, flags)
+    if yolo_preserve and (not isinstance(flags.get("yolo"), dict) or not flags.get("yolo")):
+        flags["yolo"] = dict(yolo_preserve)
     oral.cheating_flags = flags
 
     if not _has_audio_relevance_scores(db, oral.id):
@@ -2006,8 +2194,8 @@ def apply_proctoring_event(
         print("BACKEND PHONE EVENT HIT", meta, flush=True)
         ctr = flags.setdefault("counters", {})
         ctr["phone_detected_events"] = int(ctr.get("phone_detected_events") or 0) + 1
+        ctr["server_phone_confirmation_count"] = int(ctr.get("server_phone_confirmation_count") or 0) + 1
         before_pd = bool(oral.phone_detected)
-        oral.phone_detected = True
         print("BACKEND PHONE RECEIVED", {"event_type": et, "meta": meta}, flush=True)
         print("PHONE DETECTION EVENT RECEIVED:", et, meta, flush=True)
         print(
@@ -2019,10 +2207,13 @@ def apply_proctoring_event(
             },
             flush=True,
         )
-        pc = float(meta.get("phone_confidence") or meta.get("score") or 0.9)
-        w = max(0.88, min(1.0, pc))
+        pc = float(meta.get("phone_confidence") or meta.get("score") or 0.55)
+        w = max(0.45, min(1.0, pc))
         _accumulate_phone_evidence(ctr, w, meta)
         ctr["phone_confidence_peak"] = round(max(float(ctr.get("phone_confidence_peak") or 0.0), w), 3)
+        _normalize_proctoring_metadata_objects(meta)
+        if _metadata_objects_include_phone(meta):
+            ctr["phone_strict_object_events"] = int(ctr.get("phone_strict_object_events") or 0) + 1
         _evaluate_phone_detected(oral, ctr)
         print("PHONE EVIDENCE SUM:", ctr.get("phone_evidence_sum"), flush=True)
         print("PHONE DETECTED BEFORE:", before_pd, "AFTER:", oral.phone_detected, flush=True)
@@ -2041,7 +2232,7 @@ def apply_proctoring_event(
             psk_out = int(max(0, round(float(psk_ev))))
         pm.update(
             {
-                "phone_detected": True,
+                "phone_detected": bool(oral.phone_detected),
                 "phone_suspected": bool(meta.get("phone_suspected") or meta.get("phone_detected")),
                 "phone_posture_score": pps_out if pps_out is not None else pps_ev,
                 "phone_posture_streak": psk_out if psk_out is not None else psk_ev,
@@ -2108,8 +2299,6 @@ def apply_proctoring_event(
             w = max(w, 0.88)
         before_pd = bool(oral.phone_detected)
         _accumulate_phone_evidence(ctr, w, meta)
-        if strong:
-            oral.phone_detected = True
         _evaluate_phone_detected(oral, ctr)
         print("PHONE EVIDENCE SUM:", ctr.get("phone_evidence_sum"), flush=True)
         print("PHONE DETECTED BEFORE:", before_pd, "AFTER:", oral.phone_detected, flush=True)

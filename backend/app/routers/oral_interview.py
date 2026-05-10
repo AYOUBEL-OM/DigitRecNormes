@@ -938,13 +938,32 @@ async def upload_oral_snapshot(
     path.write_bytes(raw)
 
     rel = f"/uploads/oral_snapshots/{safe}"
-    print("SNAPSHOT RECEIVED:", str(path.resolve()), "bytes=", len(raw), flush=True)
+    local_image_path = path
+    ex = local_image_path.is_file()
+    sz = int(local_image_path.stat().st_size) if ex else None
+    print(
+        "SNAPSHOT RECEIVED",
+        {
+            "oral_id": str(oral.id),
+            "rel_url": rel,
+            "local_image_path": str(local_image_path.resolve()),
+            "exists": ex,
+            "size": sz,
+            "reason": reason[:80] or "interval",
+        },
+        flush=True,
+    )
     try:
-        append_snapshot(db, oral, rel, reason[:80] or "interval")
+        append_snapshot(
+            db,
+            oral,
+            rel,
+            reason[:80] or "interval",
+            local_image_path=local_image_path,
+        )
         print(
             "SNAPSHOT STORED:",
             {"oral_id": str(oral.id), "url": rel, "reason": reason[:80]},
-            "PHONE_ANALYSIS_RESULT: not_run (snapshot stored only; phone from proctoring events)",
             flush=True,
         )
     except Exception as exc:

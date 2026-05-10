@@ -35,15 +35,17 @@ from app.services.oral_answer_analysis import (
 )
 from app.services.oral_insights_storage import get_answer_insight, insight_blob_from_analysis
 from app.services.oral_proctoring import (
+    apply_proctoring_derived_scores,
     ensure_oral_proctoring_fields,
     get_proctoring_summary_text,
     normalize_proctoring_flags,
 )
+from app.services.yolo_proctoring_service import apply_yolo_snapshot_to_flags
 
 logger = logging.getLogger(__name__)
 
 # Version du cache `enterprise_report_ai` (régénère si inférieur ou champs manquants).
-AI_REPORT_SCHEMA_VERSION = 4
+AI_REPORT_SCHEMA_VERSION = 5
 
 EVENT_LABELS_FR: dict[str, str] = {
     "visibility_hidden": "Perte de visibilité de la page",
@@ -96,6 +98,11 @@ def quality_label(
 
     if gib:
         return "faible"
+    # Pertinence correcte + peu d’hésitation + énoncé clair : ne pas forcer « faible ».
+    if rel_f >= 52.0 and hes < 52.0 and coh >= 48.0:
+        if rel_f > 70.0 and hes < 48.0 and coh >= 65.0:
+            return "bonne"
+        return "moyenne"
     if rel_f < 40.0 or coh < 40.0:
         return "faible"
     if rel_f > 70.0 and hes < 48.0 and coh >= 65.0:
@@ -393,14 +400,19 @@ def heuristic_badge(oral: TestOral, questions: list[OralTestQuestion]) -> dict[s
 
 def _cache_fingerprint(oral: TestOral, questions: list[OralTestQuestion]) -> str:
     flags = normalize_proctoring_flags(oral.cheating_flags)
+    gaze = flags.get("gaze") if isinstance(flags.get("gaze"), dict) else {}
     parts = [
         str(oral.score_oral_global),
         str(oral.confidence_score),
         str(oral.stress_score),
         str(oral.tab_switch_count),
         str(oral.phone_detected),
+        str(oral.presence_anomaly_detected),
+        str(oral.other_person_detected),
+        str(int(gaze.get("samples") or 0)),
         json.dumps(flags.get("session_scores") or {}, sort_keys=True),
         json.dumps(flags.get("estimates") or {}, sort_keys=True),
+        json.dumps(flags.get("yolo") or {}, sort_keys=True),
     ]
     for q in sorted(questions, key=lambda x: x.question_order):
         parts.append((q.transcript_text or "")[:400])
@@ -438,6 +450,37 @@ def _dominant_gaze_direction_label(gaze: dict[str, Any]) -> str:
     if sum(v for _, v in pairs) <= 0.0001:
         return "unknown"
     return max(pairs, key=lambda x: x[1])[0]
+
+
+def _dominant_gaze_display_fr(gaze: dict[str, Any], samples: int) -> str:
+    """Libellé rapport : pas de « centre » sans assez d’échantillons réels."""
+    if samples < 10:
+        return "données insuffisantes"
+    pairs: list[tuple[str, float]] = [
+        ("center", float(gaze.get("center_ratio") or 0.0)),
+        ("off", float(gaze.get("off_ratio") or 0.0)),
+        ("down", float(gaze.get("down_ratio") or 0.0)),
+        ("left", float(gaze.get("left_ratio") or 0.0)),
+        ("right", float(gaze.get("right_ratio") or 0.0)),
+        ("up", float(gaze.get("up_ratio") or 0.0)),
+        ("unknown", float(gaze.get("unknown_ratio") or 0.0)),
+    ]
+    if sum(v for _, v in pairs) <= 0.0001:
+        return "données insuffisantes"
+    sorted_p = sorted(pairs, key=lambda x: -x[1])
+    best_v, second_v = sorted_p[0][1], sorted_p[1][1] if len(sorted_p) > 1 else 0.0
+    if best_v < 0.14 or (best_v - second_v) < 0.04:
+        return "non déterminé"
+    en = sorted_p[0][0]
+    return {
+        "center": "centre",
+        "left": "gauche",
+        "right": "droite",
+        "up": "haut",
+        "down": "bas",
+        "off": "hors cadre",
+        "unknown": "données insuffisantes",
+    }.get(en, "données insuffisantes")
 
 
 def _suspicion_metrics_for_ai(
@@ -574,6 +617,14 @@ def _build_ai_rich_context(
             "gaze_off_ratio": round(_ratio("gaze_off_ratio", "off_ratio"), 4),
             "gaze_center_ratio": round(_ratio("gaze_center_ratio", "center_ratio"), 4),
             "rapid_motion_heartbeat_count": int(counters.get("rapid_motion_heartbeat_count") or 0),
+            "head_movement": (
+                "suspect"
+                if (
+                    (isinstance(estimates.get("head_pose"), dict) and estimates["head_pose"].get("suspicious_head_movement") is True)
+                    or int(counters.get("suspicious_head_movement_heartbeat_count") or 0) >= 1
+                )
+                else "normal"
+            ),
         },
     }
 
@@ -671,6 +722,302 @@ def _join_sentences(parts: list[str]) -> str:
     return re.sub(r"\s+", " ", " ".join([p.strip() for p in parts if p.strip()])).strip()
 
 
+def _effective_suspicion_level_for_copy(level: str | None, score: float | None) -> str:
+    """Ne traite pas comme HIGH une alerte dont le score numérique reste bas."""
+    lv = (level or "").strip().upper()
+    sc = float(score) if score is not None else 0.0
+    if lv == "HIGH" and sc < 60.0:
+        return "MEDIUM"
+    if lv not in ("LOW", "MEDIUM", "HIGH"):
+        return "LOW"
+    return lv
+
+
+def build_behavioral_analysis(report_data: dict[str, Any]) -> dict[str, Any]:
+    """
+    Textes d’analyse comportementale : regard, mouvement, présence, suspicion (+ indices navigation / tête).
+    Les clés `stress` / `confidence` dupliquent movement/presence pour rétrocompatibilité éventuelle.
+    """
+    g_samples = int(report_data.get("gaze_samples") or 0)
+    gq = str(report_data.get("gaze_quality_label") or "").strip().lower()
+    mv = str(report_data.get("movement_level") or "").strip().lower()
+    pres_anom = bool(report_data.get("presence_anomaly_detected"))
+    pres_insuf = bool(report_data.get("presence_data_insufficient"))
+    sus_score = float(report_data.get("suspicion_score") or 0.0)
+    sus_lvl_raw = str(report_data.get("suspicion_level") or "")
+    eff_sus = _effective_suspicion_level_for_copy(sus_lvl_raw, sus_score)
+    tabs = int(report_data.get("tab_switch_count") or 0)
+    head = str(report_data.get("head_movement") or "").strip().lower()
+
+    if g_samples < 10:
+        visual = "Les données de regard sont insuffisantes pour conclure de manière fiable."
+    elif gq == "bonne" or gq.startswith("bonne"):
+        visual = "Le regard est globalement stable et orienté vers l’écran."
+    elif gq == "moyenne" or "moyenn" in gq:
+        visual = (
+            "Le regard présente quelques écarts, sans constituer à lui seul une anomalie majeure."
+        )
+    elif gq == "faible" or "faibl" in gq:
+        visual = "Le regard est souvent hors axe, ce qui peut indiquer une attention instable."
+    elif "insuffisant" in gq or "données insuffisantes" in gq:
+        visual = "Les données de regard sont insuffisantes pour conclure de manière fiable."
+    else:
+        visual = "Les données de regard sont insuffisantes pour conclure de manière fiable."
+
+    if mv in ("faible",):
+        movement = "Peu de mouvements brusques détectés pendant l’entretien."
+    elif mv in ("modéré", "modere", "modér"):
+        movement = "Quelques mouvements répétés ont été observés, à interpréter avec prudence."
+    elif mv in ("élevé", "eleve", "elev"):
+        movement = (
+            "Des mouvements fréquents ou brusques ont été détectés et peuvent nécessiter une vérification."
+        )
+    else:
+        movement = "Quelques mouvements répétés ont été observés, à interpréter avec prudence."
+
+    if pres_insuf:
+        presence = "Les données caméra sont insuffisantes pour conclure sur la stabilité de présence."
+    elif pres_anom:
+        presence = "Une anomalie de présence a été relevée pendant la session."
+    else:
+        presence = "La présence du candidat devant la caméra semble stable."
+
+    if eff_sus == "LOW":
+        suspicion = "Les indicateurs ne montrent pas de comportement fortement suspect."
+    elif eff_sus == "MEDIUM":
+        suspicion = "Certains signaux nécessitent une vérification complémentaire."
+    else:
+        suspicion = "Plusieurs signaux concordants justifient une vigilance renforcée."
+
+    extras: list[str] = []
+    if tabs >= 1:
+        extras.append(
+            f"{tabs} changement(s) d’onglet ont été enregistré(s) dans le journal de session."
+        )
+    if head == "suspect":
+        extras.append("Des mouvements de tête atypiques ont été signalés par l’analyse vidéo.")
+    if extras:
+        suspicion = suspicion + " " + " ".join(extras)
+
+    return {
+        "visual": visual,
+        "movement": movement,
+        "presence": presence,
+        "suspicion": suspicion,
+        "stress": movement,
+        "confidence": presence,
+    }
+
+
+def build_ai_like_dynamic_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    """
+    Synthèse type « deep AI » déterministe : recommendation, risk_notes, decision_reason, conclusion.
+    Les cas E (HIGH) ne s’appliquent que si le score de suspicion numérique >= 60 après correction de niveau.
+    """
+    score_raw = payload.get("score_oral_global")
+    score_f = float(score_raw) if isinstance(score_raw, (int, float)) else 52.0
+    ss = float(payload.get("suspicion_score") or 0.0)
+    sl_raw = str(payload.get("suspicion_level") or "LOW")
+    eff = _effective_suspicion_level_for_copy(sl_raw, ss)
+    rel = payload.get("average_relevance")
+    hes = payload.get("average_hesitation")
+    rel_s = f"{float(rel):.1f}" if isinstance(rel, (int, float)) else "—"
+    hes_s = f"{float(hes):.1f}" if isinstance(hes, (int, float)) else "—"
+    lang = str(payload.get("language_level") or "").strip() or "—"
+    tabs_n = int(payload.get("tab_switch_count") or 0)
+
+    if eff == "HIGH" and ss >= 60.0:
+        selected_case = "E"
+        recommendation = (
+            "Une vérification approfondie est recommandée avant toute décision."
+        )
+        risk_notes = (
+            "Plusieurs indicateurs concordants peuvent remettre en question la fiabilité de la session."
+        )
+        conclusion = "Le résultat doit être examiné avec vigilance avant validation."
+        decision_reason = (
+            f"Agrégat technique : suspicion {ss:.0f}/100 (niveau {eff}), score oral {score_f:.0f}/100, "
+            f"pertinence moyenne {rel_s}/100, hésitation moyenne {hes_s}/100, niveau linguistique indiqué : {lang}"
+            f"{f', {tabs_n} changement(s) d’onglet' if tabs_n else ''}."
+        )
+    elif eff == "MEDIUM":
+        selected_case = "D"
+        recommendation = (
+            "Une vérification complémentaire est recommandée avant toute décision finale."
+        )
+        risk_notes = "Certains signaux techniques nécessitent une analyse prudente."
+        conclusion = "Le profil doit être interprété avec prudence en raison de signaux partiels."
+        decision_reason = (
+            f"Agrégat : suspicion {ss:.0f}/100 ({eff}), score oral {score_f:.0f}/100, "
+            f"pertinence {rel_s}/100, hésitation {hes_s}/100, niveau {lang}."
+        )
+    elif score_f >= 72.0:
+        selected_case = "A"
+        recommendation = (
+            "Le candidat peut être retenu pour la suite du processus, sous réserve de validation finale par le recruteur."
+        )
+        risk_notes = "Aucun signal critique n’a été relevé dans les indicateurs disponibles."
+        conclusion = "Le profil présente des éléments favorables pour le poste."
+        decision_reason = (
+            f"Scores favorables : oral {score_f:.0f}/100, suspicion {ss:.0f}/100 ({eff}), "
+            f"pertinence {rel_s}/100, hésitation {hes_s}/100, niveau {lang}."
+        )
+    elif score_f >= 55.0:
+        selected_case = "B"
+        recommendation = (
+            "Un entretien complémentaire peut être utile pour approfondir certains points."
+        )
+        risk_notes = "Les indicateurs de surveillance restent globalement limités."
+        conclusion = "Le profil reste exploitable, avec quelques points à clarifier."
+        decision_reason = (
+            f"Profil intermédiaire : oral {score_f:.0f}/100, suspicion {ss:.0f}/100 ({eff}), "
+            f"pertinence {rel_s}/100, niveau {lang}."
+        )
+    else:
+        selected_case = "C"
+        recommendation = (
+            "Il est recommandé de vérifier les compétences métier lors d’un échange complémentaire."
+        )
+        risk_notes = (
+            "Les risques comportementaux ne sont pas significatifs, mais les réponses restent limitées."
+        )
+        conclusion = "Le candidat présente des limites sur le contenu oral évalué."
+        decision_reason = (
+            f"Contenu oral à consolider : score {score_f:.0f}/100, pertinence {rel_s}/100, "
+            f"suspicion {ss:.0f}/100 ({eff}), hésitation {hes_s}/100."
+        )
+
+    return {
+        "recommendation": recommendation,
+        "risk_notes": risk_notes,
+        "decision_reason": decision_reason,
+        "conclusion": conclusion,
+        "_selected_case": selected_case,
+    }
+
+
+def _build_dynamic_summary_payload(oral: TestOral, rich_context: dict[str, Any]) -> dict[str, Any]:
+    proc = rich_context.get("proctoring") if isinstance(rich_context.get("proctoring"), dict) else {}
+    flags = normalize_proctoring_flags(oral.cheating_flags)
+    estimates = flags.get("estimates") if isinstance(flags.get("estimates"), dict) else {}
+    counters = flags.get("counters") if isinstance(flags.get("counters"), dict) else {}
+    hp = estimates.get("head_pose") if isinstance(estimates.get("head_pose"), dict) else {}
+    head_susp = hp.get("suspicious_head_movement") is True or int(
+        counters.get("suspicious_head_movement_heartbeat_count") or 0
+    ) >= 1
+    return {
+        "score_oral_global": oral.score_oral_global,
+        "average_relevance": rich_context.get("average_relevance"),
+        "average_hesitation": rich_context.get("average_hesitation"),
+        "language_level": rich_context.get("niveau_linguistique_final"),
+        "suspicion_score": rich_context.get("suspicion_score"),
+        "suspicion_level": rich_context.get("suspicion_level"),
+        "phone_detected": bool(proc.get("phone_detected")),
+        "other_person_detected": bool(proc.get("other_person_detected")),
+        "presence_anomaly_detected": bool(proc.get("presence_anomaly_detected")),
+        "tab_switch_count": int(proc.get("tab_switch_count") or oral.tab_switch_count or 0),
+        "head_movement": "suspect" if head_susp else "normal",
+    }
+
+
+def _merge_sentences_removing_matches(text: str, pattern: Any) -> str:
+    parts = _split_sentences_fr(text)
+    kept = [p for p in parts if p and not pattern.search(p)]
+    return _join_sentences(kept)
+
+
+def _sanitize_ai_synthesis_texts(
+    ai: dict[str, Any],
+    oral: TestOral,
+    rich_context: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Cohérence des libellés : pas de mention d’anomalies absentes ; adoucissement si suspicion LOW ;
+    pas d’« excellent profil » si score oral bas, etc.
+    """
+    proc = rich_context.get("proctoring") if isinstance(rich_context.get("proctoring"), dict) else {}
+    phone = bool(proc.get("phone_detected"))
+    other = bool(proc.get("other_person_detected"))
+    pres = bool(proc.get("presence_anomaly_detected"))
+    ss = float(rich_context.get("suspicion_score") or 0.0)
+    eff = _effective_suspicion_level_for_copy(str(rich_context.get("suspicion_level") or ""), ss)
+    score_o = oral.score_oral_global
+    score_f = float(score_o) if isinstance(score_o, (int, float)) else None
+
+    out = dict(ai)
+    text_keys = (
+        "summary",
+        "recommendation",
+        "risk_notes",
+        "decision_reason",
+        "conclusion",
+        "visual_behavior",
+        "stress_assessment",
+        "confidence_assessment",
+        "suspicion_assessment",
+    )
+
+    phone_pat = re.compile(
+        r"téléphone|telephone|smartphone|portable|cellphone",
+        re.I,
+    )
+    other_pat = re.compile(
+        r"autre personne|plusieurs visages|tiers|second individu",
+        re.I,
+    )
+    pres_pat = re.compile(
+        r"anomalie de présence|visage absent|présence.*anomal|absence prolongée",
+        re.I,
+    )
+    low_forbid = re.compile(
+        r"comportement suspect|vigilance accrue|anomalies graves|fortement suspect",
+        re.I,
+    )
+    excellent_pat = re.compile(r"excellent profil|profil excellent", re.I)
+    fragile_pat = re.compile(r"profil fragile", re.I)
+
+    for k in text_keys:
+        v = out.get(k)
+        if not isinstance(v, str) or not v.strip():
+            continue
+        t = v.strip()
+        if not phone:
+            t = _merge_sentences_removing_matches(t, phone_pat)
+        if not other:
+            t = _merge_sentences_removing_matches(t, other_pat)
+        if not pres:
+            t = _merge_sentences_removing_matches(t, pres_pat)
+        if eff == "LOW":
+            t = _merge_sentences_removing_matches(t, low_forbid)
+        if score_f is not None and score_f < 62.0:
+            t = _merge_sentences_removing_matches(t, excellent_pat)
+        if score_f is not None and score_f >= 68.0 and eff != "HIGH":
+            t = _merge_sentences_removing_matches(t, fragile_pat)
+        out[k] = t.strip()
+
+    return out
+
+
+def _fallback_report_with_dynamic_summary(
+    oral: TestOral,
+    heuristic: dict[str, str],
+    rich_context: dict[str, Any],
+    proctoring_key: str,
+) -> dict[str, Any]:
+    """Groq indisponible : garde le bloc déterministe (forces/faiblesses) + synthèse dynamique."""
+    base = _deterministic_fallback_report(oral, proctoring_key, rich_context, heuristic)
+    payload = _build_dynamic_summary_payload(oral, rich_context)
+    dyn = build_ai_like_dynamic_summary(payload)
+    sel = dyn.pop("_selected_case", "?")
+    base["recommendation"] = dyn["recommendation"]
+    base["risk_notes"] = dyn["risk_notes"]
+    base["decision_reason"] = dyn["decision_reason"]
+    base["conclusion"] = dyn["conclusion"]
+    base["source"] = "deterministic_dynamic"
+    base["_selected_case"] = sel
+    return base
+
+
 def _groq_report_json(
     oral: TestOral,
     questions: list[OralTestQuestion],
@@ -702,12 +1049,12 @@ def _groq_report_json(
         "score_oral, confidence_score, stress_score, suspicion_score, suspicion_level, gaze_direction, niveau_linguistique_final, "
         "hesitation_score (ou null), et l’état des anomalies (presence_anomaly, multiple_persons, phone_detected). "
         "Formule les en style analytique, pas en liste à puces.\n\n"
-        "RÈGLES CONDITIONNELLES (à appliquer si les données le justifient ; cite les seuils avec les chiffres réels du JSON) :\n"
-        "- Si suspicion_score > 60 : mentionner explicitement une vigilance sur « comportement suspect détecté » (ton professionnel).\n"
-        "- Si confidence_score est défini et < 40 : mentionner un « manque d’assurance » à l’oral.\n"
-        "- Si gaze_direction est différent de « center » : mentionner un « regard instable » ou « regard majoritairement hors centre ».\n"
-        "- Si anomalies.any_anomaly est false ET suspicion_level est LOW : dire explicitement qu’« aucun comportement suspect détecté » "
-        "sur la base des indicateurs fournis.\n\n"
+        "RÈGLES CONDITIONNELLES (données réelles uniquement ; cite les chiffres du JSON) :\n"
+        "- Si suspicion_score >= 60 ET suspicion_level indique un niveau élevé : tu peux évoquer une vigilance renforcée, sans dramatiser.\n"
+        "- Si suspicion_level est LOW ou suspicion_score < 60 : ne pas écrire « comportement suspect », « vigilance accrue » ni « anomalies graves ».\n"
+        "- Ne mentionne téléphone / autre personne / anomalie de présence que si le booléen correspondant est true dans anomalies.\n"
+        "- Si confidence_score est défini et < 40 : tu peux évoquer un manque d’assurance à l’oral.\n"
+        "- Si gaze_direction est différent de « center » : tu peux évoquer un regard moins centré, sans accuser.\n\n"
         "INTERDICTIONS (formulations) :\n"
         "- Ne pas commencer la synthèse par « Le candidat semble » ni « Il semble que le candidat ».\n"
         "- Éviter : « performance optimale », « dans l’ensemble », « globalement satisfaisant » sans chiffre concret issu du JSON.\n\n"
@@ -965,41 +1312,6 @@ def _deterministic_fallback_report(
     }
 
 
-def _ai_unavailable_placeholder(
-    oral: TestOral,
-    heuristic: dict[str, str],
-) -> dict[str, Any]:
-    """
-    Réponse minimale si le LLM est indisponible : pas de paragraphe déterministe « type candidat »,
-    uniquement le message d’indisponibilité demandé produit.
-    """
-    msg = "Analyse indisponible (données insuffisantes ou erreur IA)."
-    flags = normalize_proctoring_flags(oral.cheating_flags)
-    ss = flags.get("session_scores") if isinstance(flags.get("session_scores"), dict) else {}
-    nivel = resolve_niveau_linguistique_final(oral.language_level_global, ss.get("language_proficiency_index"))
-    tier_raw = str(heuristic.get("key") or "bon_candidat").strip()
-    syn_map = {"excellent_candidat": "strong", "bon_candidat": "promising", "a_surveiller": "watch"}
-    syn = syn_map.get(tier_raw, "promising")
-    return {
-        "synthesis_badge_key": syn,
-        "badge_key": tier_raw,
-        "badge_display": str(heuristic.get("label") or "Profil à analyser").strip(),
-        "summary": msg,
-        "strengths": [],
-        "weaknesses": [],
-        "recommendation": msg,
-        "decision_reason": msg,
-        "risk_notes": msg,
-        "visual_behavior": "",
-        "stress_assessment": "",
-        "confidence_assessment": "",
-        "suspicion_assessment": "",
-        "conclusion": msg,
-        "source": "ai_unavailable",
-        "niveau_linguistique_final": nivel,
-    }
-
-
 def _ai_cache_entry_valid(cached: Any, fp: str) -> bool:
     if not isinstance(cached, dict):
         return False
@@ -1048,11 +1360,13 @@ def ensure_ai_report_cached(
     fp = _cache_fingerprint(oral, questions)
     cached = flags.get("enterprise_report_ai")
     if not force_refresh and _ai_cache_entry_valid(cached, fp):
+        rich_cached = _build_ai_rich_context(db, oral, questions, job_title or "")
         merged = _apply_ai_report_coherence(_cached_ai_to_response(cached), oral, flags)
+        merged = _sanitize_ai_synthesis_texts(merged, oral, rich_cached)
         return {
             k: v
             for k, v in merged.items()
-            if k not in ("confidence_score_report", "stress_score_report")
+            if k not in ("confidence_score_report", "stress_score_report", "_selected_case")
         }
 
     heur = heuristic_badge(oral, questions)
@@ -1061,11 +1375,39 @@ def ensure_ai_report_cached(
     if ai:
         out = ai
         out = _apply_ai_report_coherence(out, oral, flags)
+        out = _sanitize_ai_synthesis_texts(out, oral, rich)
+        sel_case = "groq"
     else:
-        out = _ai_unavailable_placeholder(oral, heur)
+        out = _fallback_report_with_dynamic_summary(oral, heur, rich, proctoring_key)
+        out = _apply_ai_report_coherence(out, oral, flags)
+        out = _sanitize_ai_synthesis_texts(out, oral, rich)
+        sel_case = str(out.pop("_selected_case", "deterministic_dynamic"))
+
+    proc_dbg = rich.get("proctoring") if isinstance(rich.get("proctoring"), dict) else {}
+    print(
+        "REPORT TEXT DEBUG",
+        {
+            "score_oral": oral.score_oral_global,
+            "suspicion_score": rich.get("suspicion_score"),
+            "suspicion_level": rich.get("suspicion_level"),
+            "phone_detected": bool(proc_dbg.get("phone_detected")),
+            "presence_anomaly": bool(proc_dbg.get("presence_anomaly_detected")),
+            "other_person": bool(proc_dbg.get("other_person_detected")),
+            "selected_case": sel_case,
+            "generated_text": {
+                "recommendation": str(out.get("recommendation") or "")[:220],
+                "conclusion": str(out.get("conclusion") or "")[:220],
+            },
+        },
+        flush=True,
+    )
 
     store = {
-        **{k: v for k, v in out.items() if k not in ("confidence_score_report", "stress_score_report")},
+        **{
+            k: v
+            for k, v in out.items()
+            if k not in ("confidence_score_report", "stress_score_report", "_selected_case")
+        },
         "schema_version": AI_REPORT_SCHEMA_VERSION,
         "cache_fingerprint": fp,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -1078,7 +1420,7 @@ def ensure_ai_report_cached(
     return {
         k: v
         for k, v in out.items()
-        if k not in ("confidence_score_report", "stress_score_report")
+        if k not in ("confidence_score_report", "stress_score_report", "_selected_case")
     }
 
 
@@ -1297,7 +1639,23 @@ def append_snapshot(
     oral: TestOral,
     relative_url: str,
     reason: str,
+    *,
+    local_image_path: Optional[Path] = None,
 ) -> None:
+    if local_image_path is not None:
+        lp = Path(local_image_path)
+        ex = lp.is_file()
+        sz = int(lp.stat().st_size) if ex else None
+        print(
+            "APPEND SNAPSHOT BEFORE YOLO",
+            {
+                "oral_id": str(oral.id),
+                "local_image_path": str(lp.resolve()),
+                "exists": ex,
+                "size": sz,
+            },
+            flush=True,
+        )
     flags = normalize_proctoring_flags(oral.cheating_flags)
     snaps = flags.get("snapshots")
     if not isinstance(snaps, list):
@@ -1310,10 +1668,38 @@ def append_snapshot(
         }
     )
     flags["snapshots"] = snaps[-25:]
+    if local_image_path is not None:
+        apply_yolo_snapshot_to_flags(oral, flags, Path(local_image_path))
+        print(
+            "YOLO FLAGS MERGED",
+            {
+                "phone_detected_sql": oral.phone_detected,
+                "other_person_detected_sql": oral.other_person_detected,
+                "presence_anomaly_detected_sql": oral.presence_anomaly_detected,
+                "cheating_flags_yolo": (flags.get("yolo") if isinstance(flags, dict) else None),
+            },
+            flush=True,
+        )
     oral.cheating_flags = flags
     ensure_oral_proctoring_fields(oral)
     db.add(oral)
     db.commit()
+    if local_image_path is not None:
+        print("YOLO DB COMMITTED", str(oral.id), flush=True)
+        oral = apply_proctoring_derived_scores(db, oral)
+        reloaded = db.get(TestOral, oral.id)
+        if reloaded is not None:
+            ry = reloaded.cheating_flags.get("yolo") if isinstance(reloaded.cheating_flags, dict) else None
+            print(
+                "DB RELOAD AFTER YOLO",
+                {
+                    "phone_detected": reloaded.phone_detected,
+                    "other_person_detected": reloaded.other_person_detected,
+                    "presence_anomaly_detected": reloaded.presence_anomaly_detected,
+                    "yolo": ry,
+                },
+                flush=True,
+            )
 
 
 def _oral_pdf_backend_root() -> Path:
@@ -2012,6 +2398,7 @@ def build_pdf_bytes(
         pres = bool(to.get("presence_anomaly_detected"))
         phone = bool(to.get("phone_detected"))
         other = bool(to.get("other_person_detected"))
+        phone_sig = str(pi.get("phone_signal_summary") or "").strip()
         dom = str(pi.get("dominant_direction") or "—")
         move = str(pi.get("movement_level") or "—")
         susp = str(pi.get("suspicion_level") or "—")
@@ -2081,7 +2468,14 @@ def build_pdf_bytes(
             ],
             [
                 Paragraph("Signal téléphone", body),
-                Paragraph("Oui" if phone else "Non", body),
+                Paragraph(
+                    _oral_pdf_esc_xml(
+                        (phone_sig[:300] + "…")
+                        if phone_sig and len(phone_sig) > 300
+                        else (phone_sig or ("Oui" if phone else "Non"))
+                    ),
+                    body,
+                ),
                 proc_status_mark("bad" if phone else "ok"),
             ],
             [
@@ -2092,7 +2486,11 @@ def build_pdf_bytes(
             [
                 Paragraph("Regard dominant", body),
                 Paragraph(_oral_pdf_esc_xml(dom), body),
-                proc_status_mark("ok"),
+                proc_status_mark(
+                    "warn"
+                    if dom.strip().lower().startswith("données")
+                    else "ok",
+                ),
             ],
             [
                 Paragraph("Niveau d’activité (mouvement)", body),
@@ -2134,8 +2532,8 @@ def build_pdf_bytes(
         # --- Analyse comportementale ---
         beh_labels = [
             ("Regard", str(beh.get("visual") or "").strip()),
-            ("Stress perçu", str(beh.get("stress") or "").strip()),
-            ("Confiance perçue", str(beh.get("confidence") or "").strip()),
+            ("Mouvement", str(beh.get("movement") or beh.get("stress") or "").strip()),
+            ("Présence", str(beh.get("presence") or beh.get("confidence") or "").strip()),
             ("Suspicion / intégrité de session", str(beh.get("suspicion") or "").strip()),
         ]
         beh_lines: list[Any] = []
@@ -2323,6 +2721,12 @@ def build_enterprise_report_payload(
     if not isinstance(estimates, dict):
         estimates = {}
 
+    yolo_blk = flags.get("yolo") if isinstance(flags.get("yolo"), dict) else {}
+    yl_sig = (
+        yolo_blk.get("signals_latched") if isinstance(yolo_blk.get("signals_latched"), dict) else {}
+    )
+    yl_last = yolo_blk.get("last_analysis") if isinstance(yolo_blk.get("last_analysis"), dict) else {}
+
     head_pose = estimates.get("head_pose") if isinstance(estimates.get("head_pose"), dict) else {}
     head_yaw = head_pose.get("head_yaw")
     head_pitch = head_pose.get("head_pitch")
@@ -2345,6 +2749,12 @@ def build_enterprise_report_payload(
         phone_effective = True
     elif isinstance(_pps, (int, float)) and not isinstance(_pps, bool) and float(_pps) >= 0.25:
         phone_effective = True
+    elif bool(yl_sig.get("phone_detected")) or bool(yl_sig.get("phone")):
+        phone_effective = True
+    elif yl_last.get("phone_detected") is True:
+        phone_effective = True
+    elif int(yolo_blk.get("phone_detections") or 0) > 0:
+        phone_effective = True
 
     presence_effective = False
     _prm = estimates.get("presence_metrics")
@@ -2359,6 +2769,18 @@ def build_enterprise_report_payload(
         presence_effective = True
     elif int(counters.get("multiple_faces_count") or 0) >= 1:
         presence_effective = True
+    elif bool(yl_sig.get("presence_anomaly_detected")) or bool(yl_sig.get("absence")):
+        presence_effective = True
+    elif int(yolo_blk.get("consecutive_absence_snapshots") or 0) >= 3:
+        presence_effective = True
+    elif int(yolo_blk.get("absence_detections") or 0) > 0:
+        presence_effective = True
+
+    other_person_effective = bool(test_oral.other_person_detected)
+    if bool(yl_sig.get("other_person_detected")) or bool(yl_sig.get("multiple_person")):
+        other_person_effective = True
+    elif int(yolo_blk.get("multiple_person_detections") or 0) > 0:
+        other_person_effective = True
 
     conf_for_label = conf_disp if conf_disp is not None else test_oral.confidence_score
     stress_for_label = stress_disp if stress_disp is not None else test_oral.stress_score
@@ -2390,7 +2812,7 @@ def build_enterprise_report_payload(
         "suspicious_movements_count": test_oral.suspicious_movements_count,
         "presence_anomaly_detected": presence_effective,
         "phone_detected": phone_effective,
-        "other_person_detected": test_oral.other_person_detected,
+        "other_person_detected": other_person_effective,
         "cheating_flags_global": get_proctoring_summary_text(test_oral),
         "proctoring_counters": dict(counters),
         "cheating_risk_level": estimates.get("cheating_risk_level"),
@@ -2419,7 +2841,7 @@ def build_enterprise_report_payload(
     phone_peak = float(counters.get("phone_confidence_peak") or 0.0)
     suspicion_level = str(estimates.get("cheating_risk_level") or "").strip() or "—"
     if suspicion_level not in ("LOW", "MEDIUM", "HIGH"):
-        if test_oral.phone_detected or test_oral.other_person_detected:
+        if test_oral.phone_detected or test_oral.other_person_detected or phone_effective or other_person_effective:
             suspicion_level = "HIGH"
         elif off_ratio >= 0.45 or rapid >= 8 or (test_oral.tab_switch_count or 0) >= 6:
             suspicion_level = "MEDIUM"
@@ -2431,9 +2853,17 @@ def build_enterprise_report_payload(
     pres = estimates.get("presence_analysis")
     susp_a = estimates.get("suspicion_assessment")
 
-    if isinstance(gz, dict) and gz.get("label"):
+    if g_samples < 10:
+        gaze_stability = "données insuffisantes"
+        dominant_direction = "données insuffisantes"
+        gaze_explanation = ""
+        gaze_score = None
+        gaze_professional = (
+            "Regard : données caméra ou échantillons de regard insuffisants pour une direction dominante fiable."
+        )
+    elif isinstance(gz, dict) and gz.get("label"):
         gaze_stability = str(gz["label"])
-        dominant_direction = str(gz.get("dominant_direction") or "—")
+        dominant_direction = _dominant_gaze_display_fr(gaze, g_samples)
         gaze_explanation = str(gz.get("explanation") or "").strip()
         gaze_score = gz.get("score")
         gaze_professional = (
@@ -2441,19 +2871,11 @@ def build_enterprise_report_payload(
             if gaze_explanation
             else gaze_stability
         )
+        if str(gaze_stability).strip().lower() == "données insuffisantes":
+            dominant_direction = "données insuffisantes"
     else:
         gaze_stability = str(estimates.get("gaze_stability_label") or "—")
-        dominant_direction = (
-            "centre"
-            if center_ratio >= max(off_ratio, down_ratio, left_ratio, right_ratio)
-            else "hors cadre"
-            if off_ratio >= max(center_ratio, down_ratio, left_ratio, right_ratio)
-            else "bas"
-            if down_ratio >= max(center_ratio, off_ratio, left_ratio, right_ratio)
-            else "gauche"
-            if left_ratio >= right_ratio
-            else "droite"
-        )
+        dominant_direction = _dominant_gaze_display_fr(gaze, g_samples)
         gaze_explanation = ""
         gaze_score = None
         gaze_professional = (
@@ -2461,6 +2883,8 @@ def build_enterprise_report_payload(
             if gaze_stability and gaze_stability != "—"
             else "Données de regard limitées sur cette session."
         )
+        if str(gaze_stability).strip().lower() == "données insuffisantes":
+            dominant_direction = "données insuffisantes"
 
     if isinstance(mv, dict) and mv.get("label"):
         movement_level = str(mv["label"])
@@ -2514,7 +2938,7 @@ def build_enterprise_report_payload(
     head_cnt = int(counters.get("suspicious_head_movement_heartbeat_count") or 0)
     sql_head_cnt = int(getattr(test_oral, "suspicious_movements_count", 0) or 0)
     head_repeated = head_cnt >= 2 or sql_head_cnt >= 2
-    if phone_effective or presence_effective:
+    if phone_effective or presence_effective or other_person_effective:
         susp_val = max(susp_val, 35.0)
     if suspicious_head:
         if head_repeated:
@@ -2523,7 +2947,7 @@ def build_enterprise_report_payload(
             susp_val = max(susp_val, 25.0)
     suspicion_numeric = round(susp_val, 2)
     _sl = str(suspicion_level).strip().upper()
-    if (phone_effective or presence_effective) and _sl == "LOW":
+    if (phone_effective or presence_effective or other_person_effective) and _sl == "LOW":
         suspicion_level = "MEDIUM"
     elif suspicious_head and head_repeated and _sl == "LOW":
         suspicion_level = "MEDIUM"
@@ -2544,6 +2968,48 @@ def build_enterprise_report_payload(
             if suspicion_numeric is not None
             else f"{suspicion_level} — interprétation à partir des compteurs disponibles."
         )
+
+    source_detection = (
+        "YOLOv8" if yolo_blk.get("available") is True else "heuristique navigateur"
+    )
+
+    pps_num = float(_pps) if isinstance(_pps, (int, float)) and not isinstance(_pps, bool) else 0.0
+    if test_oral.phone_detected is True:
+        if yolo_blk.get("available") is True and (
+            yl_sig.get("phone") or yl_sig.get("phone_detected")
+        ):
+            phone_signal_summary = (
+                "Indicateur téléphone confirmé sur la session "
+                "(YOLOv8 sur snapshots caméra ; corroboration possible avec heuristiques navigateur)."
+            )
+        else:
+            phone_signal_summary = (
+                "Indicateur téléphone confirmé sur la session (agrégat technique / navigateur)."
+            )
+    elif phone_effective and (pps_num >= 0.22 or phone_peak >= 0.22):
+        phone_signal_summary = (
+            "Suspicion téléphone (posture / heuristiques navigateur ; "
+            "YOLOv8 peut affiner si les snapshots sont disponibles côté serveur)."
+        )
+    elif phone_effective:
+        phone_signal_summary = "Indices téléphone non confirmés ou ambigus sur les agrégats."
+    else:
+        phone_signal_summary = "Aucun signal téléphone significatif sur les agrégats disponibles."
+
+    print(
+        "REPORT YOLO READ",
+        {
+            "phone_detected_sql": test_oral.phone_detected,
+            "other_person_sql": test_oral.other_person_detected,
+            "presence_sql": test_oral.presence_anomaly_detected,
+            "yolo": flags.get("yolo"),
+            "source_detection": source_detection,
+            "phone_effective": phone_effective,
+            "presence_effective": presence_effective,
+            "other_person_effective": other_person_effective,
+        },
+        flush=True,
+    )
 
     proctoring_insights = {
         "gaze_stability": gaze_stability,
@@ -2566,12 +3032,18 @@ def build_enterprise_report_payload(
         "suspicion_professional": suspicion_professional,
         "suspicion_score": suspicion_numeric,
         "suspicion_signals": sigs,
+        "phone_signal_summary": phone_signal_summary,
+        "source_detection": source_detection,
         "signals": {
             "phone_detected": bool(phone_effective),
             "phone_confidence_peak": round(phone_peak, 3),
-            "other_person_detected": bool(test_oral.other_person_detected),
-            "max_faces_count": max_faces,
+            "other_person_detected": bool(other_person_effective),
+            "other_person_hint_yolo": bool(yl_sig.get("multiple_person")),
             "presence_anomaly_detected": bool(presence_effective),
+            "presence_absence_hint_yolo": bool(
+                yl_sig.get("absence") or yl_sig.get("presence_anomaly_detected")
+            ),
+            "max_faces_count": max_faces,
             "gaze_off_ratio": round(off_ratio, 4),
             "gaze_down_ratio": round(down_ratio, 4),
             "gaze_samples": g_samples,
@@ -2608,26 +3080,27 @@ def build_enterprise_report_payload(
             },
         )
 
-    stress_bh = float(stress_for_label) if stress_for_label is not None else 0.0
-    conf_bh = float(conf_for_label) if conf_for_label is not None else 0.0
-    behavioral_analysis = {
-        "visual": gaze_professional,
-        "stress": (
-            "Signes de stress potentiels (stress estimé élevé et mouvements fréquents)."
-            if stress_bh >= 62 and rapid >= 8
-            else "Stress estimé modéré ; vigilance si hésitations visibles dans certaines réponses."
-            if stress_bh >= 38
-            else "Stress estimé faible ; comportement relativement stable."
-        ),
-        "confidence": (
-            "Confiance perçue élevée (stabilité session + indicateurs de confiance)."
-            if conf_bh >= 72 and off_ratio <= 0.3
-            else "Confiance perçue modérée ; marge de progression possible dans l’aisance à l’oral."
-            if conf_bh >= 52
-            else "Confiance perçue plutôt faible ; réponses potentiellement plus hésitantes."
-        ),
-        "suspicion": suspicion_professional,
-    }
+    head_movement_label = "suspect" if suspicious_head else "normal"
+    try:
+        suspicion_num_behavior = float(suspicion_numeric) if suspicion_numeric is not None else 0.0
+    except (TypeError, ValueError):
+        suspicion_num_behavior = 0.0
+    behavioral_analysis = build_behavioral_analysis(
+        {
+            "gaze_samples": g_samples,
+            "gaze_quality_label": str(gaze_stability or "").strip().lower(),
+            "movement_level": str(movement_level or "").strip().lower(),
+            "presence_anomaly_detected": bool(presence_effective),
+            "presence_data_insufficient": g_samples < 10,
+            "suspicion_score": suspicion_num_behavior,
+            "suspicion_level": str(suspicion_level),
+            "tab_switch_count": int(test_oral.tab_switch_count or 0),
+            "head_movement": head_movement_label,
+        }
+    )
+
+    test_payload["phone_signal_summary"] = phone_signal_summary
+    test_payload["dominant_gaze_display"] = dominant_direction
 
     cand_row = (
         db.query(Candidat.prenom, Candidat.nom)
